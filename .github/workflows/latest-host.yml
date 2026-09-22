@@ -1,0 +1,88 @@
+name: Latest host
+
+on:
+  schedule:
+    - cron: '43 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  latest-host:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+      - run: npm ci
+      - run: npm run build:clean
+      - name: Resolve the latest OMP release
+        id: omp
+        run: |
+          set -euo pipefail
+          VERSION=$(npm view @oh-my-pi/pi-coding-agent version)
+          MAJOR=${VERSION%%.*}
+          case "$MAJOR" in
+            ''|*[!0-9]*) echo "unexpected latest OMP version: $VERSION"; exit 1 ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "major=$MAJOR" >> "$GITHUB_OUTPUT"
+      - name: Install the latest OMP distribution into a temporary prefix
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/omp-latest" --no-save "@oh-my-pi/pi-coding-agent@${{ steps.omp.outputs.version }}"
+      - name: The compatibility range is never widened automatically
+        run: |
+          set -euo pipefail
+          jq -e '.ompCompat.min == "18.2.6" and .ompCompat.maxExclusive == "19.0.0"' package.json
+      - name: Load dist/extension.js through the latest OMP CLI
+        env:
+          PI_CODING_AGENT_DIR: ${{ runner.temp }}/omp-agent-dir
+          OMP_PEERS_DIR: ${{ runner.temp }}/omp-peers-state
+        run: |
+          set -euo pipefail
+          mkdir -p "$PI_CODING_AGENT_DIR"
+          BIN="$RUNNER_TEMP/omp-latest/node_modules/.bin/omp"
+          "$BIN" --version
+          EXT="$GITHUB_WORKSPACE/dist/extension.js"
+          test -f "$EXT"
+          "$BIN" models -e "$EXT"
+          if [ -e "$OMP_PEERS_DIR" ] && [ -n "$(ls -A "$OMP_PEERS_DIR")" ]; then
+            echo "peer state was created outside an arming top-level session"
+            exit 1
+          fi
+      - name: State the version-gate expectation for this host
+        env:
+          OMP_VERSION: ${{ steps.omp.outputs.version }}
+          OMP_MAJOR: ${{ steps.omp.outputs.major }}
+        run: |
+          set -euo pipefail
+          if [ "$OMP_MAJOR" -ge 19 ]; then
+            echo "Latest OMP $OMP_VERSION is 19 or newer: activation must fail closed cleanly."
+          else
+            echo "Latest OMP $OMP_VERSION is 18.x: activation must pass."
+          fi
+      - name: Host harness against the resolved latest version
+        env:
+          OMP_VERSION: ${{ steps.omp.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Scenario a is overridden with the resolved latest version: armed only
+          # inside [18.2.6, 19.0.0); inert (the expected pass) at 19.0.0+ or below the floor.
+          EXPECT=$(node -e '
+            const m = /^(\d+)\.(\d+)\.(\d+)/.exec(process.argv[1]);
+            if (m === null) { console.error("unexpected latest OMP version: " + process.argv[1]); process.exit(1); }
+            const n = [1, 2, 3].map((i) => Number(m[i]));
+            const gte = (a, b) => { for (let i = 0; i < 3; i += 1) { if (a[i] !== b[i]) return a[i] > b[i]; } return true; };
+            console.log(gte(n, [18, 2, 6]) && !gte(n, [19, 0, 0]) ? "armed" : "inert");
+          ' "$OMP_VERSION")
+          node scripts/smoke-host.mjs --version "$OMP_VERSION" | tee "$RUNNER_TEMP/smoke-host-resolved.txt"
+          grep -F "pass a-supported: $EXPECT" "$RUNNER_TEMP/smoke-host-resolved.txt"

@@ -1,62 +1,51 @@
 /**
- * Presence — one owner-written heartbeat file per peer process.
+ * Presence v2: one owner-written heartbeat record per peer process under
+ * <roots.peersDir>. Reads are bounded and ownership-checked; retention
+ * follows plan section 3 exactly:
  *
- * `<state>/peers/<pid>.json` is written via `durableWriteJson` (sidecar +
- * fsync + copy-over, never a rename over a live file) on a 15s beat. A peer
- * is live while its beat is at most 45s old AND its pid answers
- * `process.kill(pid, 0)`. Stale records are reaped (unlinked on sight).
- * Shutdown unlinks the own record.
+ *  - a beat is fresh through exactly PRESENCE_TTL_MS and expired just after;
+ *  - only an ESRCH pid probe may unlink a record (and, for an exact v2
+ *    (pid, instance) pair, its derived endpoint); EPERM, access denied, and
+ *    unknown probe errors mean alive/unknown, so the record is retained;
+ *  - expired or malformed records owned by a live pid are ignored, retained,
+ *    and never dialed;
+ *  - future versions are ignored, never deleted; live v1 records are shown
+ *    as incompatible and never dialed; a dead v1 record may be removed but
+ *    its legacy PID-only socket is never unlinked automatically;
+ *  - every path comes from the trusted roots plus a validated (pid,
+ *    instance), never from record content.
  */
-import type { HarnessKind, PeerRecord, PeerTodo } from '../types.js';
-export declare const HEARTBEAT_MS = 15000;
-export declare const PEER_TTL_MS = 45000;
-export interface BeatInput {
-    stateDir: string;
-    pid?: number;
-    name: string;
-    cwd: string;
-    harness: HarnessKind;
-    sessionId?: string;
-    model?: string;
-    socket: string;
-    startedAt: number;
-    busy?: boolean;
-    activity?: string;
-    todos?: PeerTodo[];
+import type { StateRoots } from '../store/paths.js';
+import type { PeerIdentity, PeerRecordV2 } from './protocol.js';
+export interface PeerScan {
+    /** Fresh, live-pid, valid v2 records; name convergence is the caller's job. */
+    routable: PeerRecordV2[];
+    /** Live v1/future records: shown for diagnostics, never dialed. */
+    incompatible: Array<{
+        pid: number;
+        version: number;
+    }>;
 }
-/** Write (or refresh) this process's presence record. Owner-only writer. */
-export declare function writePeerBeat(input: BeatInput): Promise<PeerRecord>;
-export interface ListPeersOptions {
-    now?: number;
-    /** Liveness probe seam (default: `process.kill(pid, 0)`). */
-    isAlive?: (pid: number) => boolean;
-}
+/** Write (or refresh) this process's record atomically at 0600 on POSIX. */
+export declare function writeOwnRecord(roots: StateRoots, record: PeerRecordV2): Promise<void>;
 /**
- * List live peers, reaping stale records on sight: wrong-shape files, dead
- * pids, and beats older than the TTL are unlinked. Unparseable files are
- * left alone (torn reads), as are well-shaped records from a newer schema
- * version. A unix socket is unlinked only when its pid is confirmed dead —
- * a live peer keeps its socket even on a stale beat — and orphan
- * `<pid>.sock` files with no live owner are reaped too. Results sort by name.
+ * Bounded directory scan: at most MAX_DIR_ENTRIES entries examined, each
+ * record read through an 8 KiB bound after regular/non-symlink/owner/mode
+ * checks. Never throws; a missing or unreadable directory yields an empty
+ * scan.
  */
-export declare function listLivePeers(stateDir: string, selfPid: number, opts?: ListPeersOptions): Promise<PeerRecord[]>;
-/** Remove one presence record (+ its unix socket on non-Windows, dead pids only). */
-export declare function removePeerRecord(stateDir: string, pid: number, opts?: {
-    isAlive?: (pid: number) => boolean;
-}): Promise<void>;
-export interface PresenceBeatOptions {
-    intervalMs?: number;
-    onError?: (err: unknown) => void;
-    /** Host-managed timers (omp) when available; raw unref'd timer otherwise. */
-    setInterval?: (callback: () => void, ms?: number) => unknown;
-    clearTimer?: (timer: unknown) => void;
-}
+export declare function scanPeers(roots: StateRoots, self: PeerIdentity, now?: number): Promise<PeerScan>;
 /**
- * Run `tick` immediately and every `intervalMs`. The tick body never throws
- * into the host: failures route to `onError`. Returns a `stop` handle.
+ * Read a single record under exactly the scan acceptance rules (8 KiB bound,
+ * regular/non-symlink/owner/mode, identity match, freshness, live pid).
+ * Returns undefined when unusable, stale, or the pid is provably dead.
  */
-export declare function startPresenceBeat(tick: () => Promise<void> | void, opts?: PresenceBeatOptions): {
-    stop(): void;
-};
+export declare function readPeerRecord(roots: StateRoots, pid: number, instance: string, now?: number): Promise<PeerRecordV2 | undefined>;
+/**
+ * Remove only this process's exact (pid, instance) record and its derived
+ * endpoint. Invalid identity arguments are ignored rather than resolved into
+ * a path; unlink failures never propagate.
+ */
+export declare function removeOwnRecord(roots: StateRoots, pid: number, instance: string): Promise<void>;
 /** `3s ago` / `12m ago` / `2h ago` for the `/peers` beat-age column. */
 export declare function formatBeatAge(beatAt: number, now?: number): string;

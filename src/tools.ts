@@ -1,69 +1,70 @@
 /**
- * Agent tool surface: `peer_send`, `peer_status`, and `peer_request`.
+ * Agent tool surface: `peer_send`, `peer_request`, and `peer_status`.
  *
- * Registered UNCONDITIONALLY in every mode: on omp hosts the bridge carries
- * peers as native `hub` refs, but those are best-effort (the bridge may bind
- * a foreign registry copy on compiled hosts), so `peer_send {to, message,
- * replyTo?}` is THE guaranteed agent path everywhere. `peer_status` reads the
- * heartbeat, which mirrors each peer's NATIVE todo list and current activity —
- * there is no peer-owned todo to maintain. Explicit names only — `to:"all"`
- * is refused.
+ * Explicit peer names only - `to:"all"` is refused by the outbound pipeline.
+ * Every execute handler returns text and never throws. Results render through
+ * `renderReceipt`, which prints the protocol machine codes verbatim
+ * (`submitted`, `followup_submitted`, `held`, `reply_consumed`, `status`,
+ * `pong`, every refusal and local transport code) and never claims more than
+ * the plugin synchronously did.
  */
 
-import { randomUUID } from 'node:crypto';
-import type { ExtensionHostLike } from './peers/host.js';
-import { formatBeatAge } from './peers/presence.js';
-import type { OutboundDeps } from './peers/outbound.js';
-import type { PeerRecord, PeerTodo, PendingReply } from './types.js';
+import type { ExtensionHostLike, ToolInvokeResult } from './peers/host.js';
+import type { OutboundResult } from './peers/outbound.js';
+import {
+  BODY_MAX_BYTES,
+  MAX_STATUS_ACTIVITY_BYTES,
+  MAX_STATUS_TEXT_BYTES,
+  MAX_STATUS_TODOS,
+  PROJECT_MAX_BYTES,
+  REQUEST_TIMEOUT_DEFAULT_MS,
+  REQUEST_TIMEOUT_MAX_MS,
+  REQUEST_TIMEOUT_MIN_MS,
+  isSuccessCode,
+} from './peers/protocol.js';
+import type { StatusSnapshot } from './peers/protocol.js';
+import { sanitizeDisplay } from './peers/roster.js';
+import type { PeerTodo } from './types.js';
 
-export interface PeerSendDeps {
-  send: (to: string, message: string, replyTo?: string) => Promise<string>;
+export interface PeerToolDeps {
+  send(to: string, body: string, opts: { replyTo?: string }): Promise<OutboundResult>;
+  request(to: string, body: string, opts: { timeoutMs?: number }): Promise<OutboundResult>;
+  status(to: string): Promise<OutboundResult>;
 }
 
-export function registerPeerSendTool(pi: ExtensionHostLike, deps: PeerSendDeps): void {
-  pi.registerTool({
-    name: 'peer_send',
-    label: 'Peer Send',
-    description:
-      'Send a message to another live peer instance by name (see `/peers`). Only use when the user explicitly asks for cross-instance contact, or to reply to an inbound peer message — never use peers as subagents on your own. It is delivered as a real prompt: it steers the peer mid-turn or wakes it if idle. Fire-and-forget — the peer\'s reply arrives as a separate peer message.',
-    parameters: {
-      type: 'object',
-      properties: {
-        to: { type: 'string', description: 'Peer name, as listed by `/peers`' },
-        message: { type: 'string', description: 'Message body' },
-        replyTo: { type: 'string', description: 'Message id being answered' },
-      },
-      required: ['to', 'message'],
-      additionalProperties: false,
-    },
-    execute: async (_toolCallId, params) => {
-      try {
-        const to = typeof params['to'] === 'string' ? (params['to'] as string) : '';
-        const message = typeof params['message'] === 'string' ? (params['message'] as string) : '';
-        const replyTo = typeof params['replyTo'] === 'string' ? (params['replyTo'] as string) : undefined;
-        return { content: [{ type: 'text', text: await deps.send(to, message, replyTo) }] };
-      } catch (err) {
-        return {
-          content: [{ type: 'text', text: `peer_send failed: ${err instanceof Error ? err.message : String(err)}` }],
-        };
-      }
-    },
-  });
+type ToolSpec = Parameters<ExtensionHostLike['registerTool']>[0];
+
+function textResult(text: string): ToolInvokeResult {
+  return { content: [{ type: 'text', text }] };
 }
 
-export interface PeerStatusDeps {
-  listPeers: () => Promise<PeerRecord[]>;
-  now?: () => number;
+function str(value: unknown): string {
+  return typeof value === 'string' ? value : '';
 }
 
-/** Checklist box for one native/legacy todo status. */
+function errText(err: unknown): string {
+  return sanitizeDisplay(err instanceof Error ? err.message : String(err), MAX_STATUS_TEXT_BYTES);
+}
+
+/** Register one tool without throwing into the host; the convergence poll detects a missing name. */
+function tryRegisterTool(pi: ExtensionHostLike, spec: ToolSpec): void {
+  try {
+    pi.registerTool(spec);
+  } catch (err) {
+    try {
+      pi.logger?.warn(`peer tool ${spec.name} not registered: ${errText(err)}`);
+    } catch {
+      // Logger is best-effort.
+    }
+  }
+}
+
+/** Checklist box for one todo status. */
 function todoBox(status: PeerTodo['status']): string {
   switch (status) {
     case 'completed':
-    case 'done':
       return '[x]';
     case 'in_progress':
-    case 'doing':
       return '[~]';
     case 'blocked':
       return '[!]';
@@ -75,186 +76,179 @@ function todoBox(status: PeerTodo['status']): string {
 }
 
 function todoLine(todo: PeerTodo): string {
-  const blocker = todo.status === 'blocked' && todo.blocker ? ` — ${todo.blocker}` : '';
-  return `- ${todoBox(todo.status)} ${todo.text}${blocker}`;
+  const text = sanitizeDisplay(str(todo.text), MAX_STATUS_TEXT_BYTES);
+  const blocker =
+    typeof todo.blocker === 'string' && todo.blocker !== ''
+      ? ` (blocker: ${sanitizeDisplay(todo.blocker, MAX_STATUS_TEXT_BYTES)})`
+      : '';
+  return `- ${todoBox(todo.status)} ${text}${blocker}`;
 }
 
-/** Native phases render as headers; todos without one stay flat. */
-function renderTodos(todos: PeerTodo[]): string[] {
-  const lines = [`Todos (${todos.length}):`];
+/** Bounded status detail: state, model, activity, todos grouped by phase. */
+function renderStatusSnapshot(status: StatusSnapshot): string[] {
+  const lines = [`state: ${status.busy ? 'working' : 'idle'}`];
+  if (typeof status.model === 'string' && status.model !== '') {
+    lines.push(`model: ${sanitizeDisplay(status.model, MAX_STATUS_ACTIVITY_BYTES)}`);
+  }
+  if (typeof status.activity === 'string' && status.activity !== '') {
+    lines.push(`activity: ${sanitizeDisplay(status.activity, MAX_STATUS_ACTIVITY_BYTES)}`);
+  }
+  const todos = Array.isArray(status.todos) ? status.todos.slice(0, MAX_STATUS_TODOS) : [];
+  if (todos.length === 0) {
+    lines.push('todos: none');
+    return lines;
+  }
+  lines.push(`todos (${todos.length}):`);
   const groups = new Map<string, PeerTodo[]>();
   for (const todo of todos) {
-    const phase = todo.phase ?? '';
+    if (typeof todo !== 'object' || todo === null) continue;
+    const phase = str(todo.phase);
     const group = groups.get(phase);
     if (group === undefined) groups.set(phase, [todo]);
     else group.push(todo);
   }
   for (const [phase, group] of groups) {
-    if (phase !== '') lines.push(`Phase: ${phase}`);
+    if (phase !== '') lines.push(`phase: ${sanitizeDisplay(phase, MAX_STATUS_TEXT_BYTES)}`);
     for (const todo of group) lines.push(todoLine(todo));
   }
   return lines;
 }
 
-export function registerPeerStatusTool(pi: ExtensionHostLike, deps: PeerStatusDeps): void {
-  pi.registerTool({
-    name: 'peer_status',
-    label: 'Peer Status',
+/**
+ * Render one outbound result: target plus the exact machine code vocabulary,
+ * bounded sanitized detail, and bounded status detail when present. Never
+ * substitutes softer words for a code.
+ */
+export function renderReceipt(to: string, result: OutboundResult): string {
+  const code = typeof result.code === 'string' ? result.code : 'invalid_request';
+  const lines = [`\`${sanitizeDisplay(to, PROJECT_MAX_BYTES)}\`: ${code}`];
+  if (code === 'held') {
+    lines.push('hint: retained only, not read; do not resend');
+  }
+  if (typeof result.detail === 'string' && result.detail !== '') {
+    lines.push(`detail: ${sanitizeDisplay(result.detail, MAX_STATUS_TEXT_BYTES)}`);
+  }
+  if (result.status !== undefined && typeof result.status === 'object' && result.status !== null) {
+    lines.push(...renderStatusSnapshot(result.status));
+  }
+  return lines.join('\n');
+}
+
+/** Status hint for a semantic request timeout: a live status pull, degraded to text on failure. */
+async function statusHint(to: string, deps: PeerToolDeps): Promise<string> {
+  try {
+    return renderReceipt(to, await deps.status(to));
+  } catch (err) {
+    return `peer_status failed: ${errText(err)}`;
+  }
+}
+
+export function registerPeerTools(pi: ExtensionHostLike, deps: PeerToolDeps): void {
+  tryRegisterTool(pi, {
+    name: 'peer_send',
+    label: 'Peer Send',
     description:
-      "Check what another live peer is doing: busy/idle, current activity, its native todo list (grouped by phase, newest state), and last heartbeat age. `to` is the peer name from `/peers`.",
+      'Fire-and-forget message to one explicitly named live peer (see /peers); `to:"all"` is refused by the pipeline. Receipts name exactly what happened: only the local submission outcome, never more; the peer reply arrives later as a separate peer message, not in this result.',
     parameters: {
       type: 'object',
       properties: {
-        to: { type: 'string', description: 'Peer name, as listed by `/peers`' },
+        to: { type: 'string', description: 'Explicit peer name as listed by /peers' },
+        message: { type: 'string', description: 'Message body' },
+        replyTo: { type: 'string', description: 'Message id being answered, from an inbound [id ...] marker' },
+      },
+      required: ['to', 'message'],
+      additionalProperties: false,
+    },
+    execute: async (_toolCallId, params) => {
+      try {
+        const to = str(params['to']).trim();
+        const message = str(params['message']);
+        if (to === '' || message.trim() === '') {
+          return textResult('Both `to` and `message` are required.');
+        }
+        const replyTo = str(params['replyTo']).trim();
+        const result = await deps.send(to, message, replyTo === '' ? {} : { replyTo });
+        return textResult(renderReceipt(to, result));
+      } catch (err) {
+        return textResult(`peer_send failed: ${errText(err)}`);
+      }
+    },
+  });
+
+  tryRegisterTool(pi, {
+    name: 'peer_request',
+    label: 'Peer Request',
+    description: `Ask one explicitly named live peer (see /peers); \`to:"all"\` is refused by the pipeline. Waits for the matching reply: timeout_ms defaults to ${REQUEST_TIMEOUT_DEFAULT_MS} ms and is clamped to ${REQUEST_TIMEOUT_MIN_MS}-${REQUEST_TIMEOUT_MAX_MS} ms. Returns the reply text on success, or the receipt and a status hint when no reply arrives in time (a late reply may still arrive as a peer message). Receipts name exactly what happened, never more.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: 'Explicit peer name as listed by /peers' },
+        message: { type: 'string', description: 'Message body' },
+        timeout_ms: {
+          type: 'number',
+          description: `Reply wait in milliseconds (default ${REQUEST_TIMEOUT_DEFAULT_MS}, clamped ${REQUEST_TIMEOUT_MIN_MS}-${REQUEST_TIMEOUT_MAX_MS})`,
+        },
+      },
+      required: ['to', 'message'],
+      additionalProperties: false,
+    },
+    execute: async (_toolCallId, params) => {
+      try {
+        const to = str(params['to']).trim();
+        const message = str(params['message']);
+        if (to === '' || message.trim() === '') {
+          return textResult('Both `to` and `message` are required.');
+        }
+        let timeoutMs = REQUEST_TIMEOUT_DEFAULT_MS;
+        if ('timeout_ms' in params) {
+          const n = Number(params['timeout_ms']);
+          if (!Number.isFinite(n)) {
+            return textResult(
+              `\`timeout_ms\` must be a number between ${REQUEST_TIMEOUT_MIN_MS} and ${REQUEST_TIMEOUT_MAX_MS} ms.`
+            );
+          }
+          timeoutMs = Math.max(REQUEST_TIMEOUT_MIN_MS, Math.min(REQUEST_TIMEOUT_MAX_MS, Math.trunc(n)));
+        }
+        const result = await deps.request(to, message, { timeoutMs });
+        const head = renderReceipt(to, result);
+        if (typeof result.replyBody === 'string' && result.replyBody !== '') {
+          return textResult(`${head}\nreply: ${sanitizeDisplay(result.replyBody, BODY_MAX_BYTES)}`);
+        }
+        if (isSuccessCode(result.code)) {
+          const hint = await statusHint(to, deps);
+          return textResult(
+            `${head}\nno reply within ${timeoutMs} ms; a late reply may still arrive as a peer message; status hint:\n${hint}`
+          );
+        }
+        return textResult(head);
+      } catch (err) {
+        return textResult(`peer_request failed: ${errText(err)}`);
+      }
+    },
+  });
+
+  tryRegisterTool(pi, {
+    name: 'peer_status',
+    label: 'Peer Status',
+    description: `Pull bounded status detail from one explicitly named live peer (see /peers); \`to:"all"\` is refused by the pipeline. Returns busy/idle, model, activity, and at most ${MAX_STATUS_TODOS} todos. Receipts name exactly what happened, never more.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: 'Explicit peer name as listed by /peers' },
       },
       required: ['to'],
       additionalProperties: false,
     },
     execute: async (_toolCallId, params) => {
       try {
-        const to = typeof params['to'] === 'string' ? (params['to'] as string) : '';
-        if (to === '') return { content: [{ type: 'text', text: 'Peer name (`to`) is required.' }] };
-        const peers = await deps.listPeers();
-        const peer = peers.find((p) => p.name === to);
-        if (peer === undefined) {
-          return { content: [{ type: 'text', text: `No live peer named "${to}". Use /peers to see who is live.` }] };
+        const to = str(params['to']).trim();
+        if (to === '') {
+          return textResult('Peer name (`to`) is required.');
         }
-        const now = deps.now?.() ?? Date.now();
-        const lines = [
-          `\`${peer.name}\` is ${peer.busy ? 'working' : 'idle'} in ${peer.cwd} · beat ${formatBeatAge(peer.beatAt, now)}.`,
-          `Activity: ${peer.activity ?? '—'}`,
-        ];
-        if (peer.todos !== undefined && peer.todos.length > 0) {
-          lines.push(...renderTodos(peer.todos));
-        } else {
-          lines.push('Todos: none');
-        }
-        return { content: [{ type: 'text', text: lines.join('\n') }] };
+        const result = await deps.status(to);
+        return textResult(renderReceipt(to, result));
       } catch (err) {
-        return { content: [{ type: 'text', text: `peer_status failed: ${err instanceof Error ? err.message : String(err)}` }] };
-      }
-    },
-  });
-}
-
-export interface PeerRequestDeps {
-  ownName: () => string;
-  /** Hop for a request to `to` — a request is never a reply, so it may only stay level or advance. */
-  getHop: (to: string) => number;
-  send: (to: string, message: string, deps: OutboundDeps) => Promise<string>;
-  listPeers: () => Promise<PeerRecord[]>;
-  getPendingReplies: () => Map<string, PendingReply> | undefined;
-  getNow?: () => number;
-}
-
-async function statusHintFor(to: string, listPeers: () => Promise<PeerRecord[]>, now: number): Promise<string> {
-  try {
-    const peers = await listPeers();
-    const peer = peers.find((p) => p.name === to);
-    if (peer === undefined) return `No live peer named "${to}". Use /peers to see who is live.`;
-    return `\`${peer.name}\` is ${peer.busy ? 'working' : 'idle'} · ${peer.activity ?? 'no activity'} · ${peer.todos?.length ?? 0} todos · beat ${formatBeatAge(peer.beatAt, now)}.`;
-  } catch {
-    return 'Use peer_status for details.';
-  }
-}
-
-export function registerPeerRequestTool(pi: ExtensionHostLike, deps: PeerRequestDeps): void {
-  pi.registerTool({
-    name: 'peer_request',
-    label: 'Peer Request',
-    description:
-      'Send a message to another live peer and wait for a matching reply with a timeout. `to` is the peer name, `message` the body. `timeout_ms` defaults to 30000 and is clamped between 5000 and 120000. `replyTo` is an optional correlation id; one is generated if omitted. The tool returns the reply body or a timeout message with a peer_status hint.',
-    parameters: {
-      type: 'object',
-      properties: {
-        to: { type: 'string', description: 'Peer name, as listed by `/peers`' },
-        message: { type: 'string', description: 'Message body' },
-        timeout_ms: { type: 'number', description: 'Reply timeout in milliseconds (5000–120000, default 30000)' },
-        replyTo: { type: 'string', description: 'Optional correlation id; generated if omitted' },
-      },
-      required: ['to', 'message'],
-      additionalProperties: false,
-    },
-    execute: async (_toolCallId, params) => {
-      const to = typeof params['to'] === 'string' ? (params['to'] as string) : '';
-      const message = typeof params['message'] === 'string' ? (params['message'] as string) : '';
-      if (to === '' || message === '') {
-        return { content: [{ type: 'text', text: 'Both `to` and `message` are required.' }] };
-      }
-
-      let timeoutMs = 30_000;
-      if ('timeout_ms' in params) {
-        const n = Number(params['timeout_ms']);
-        if (Number.isFinite(n)) {
-          timeoutMs = Math.max(5_000, Math.min(120_000, Math.trunc(n)));
-        }
-      }
-
-      const replyTo =
-        typeof params['replyTo'] === 'string' && (params['replyTo'] as string) !== ''
-          ? (params['replyTo'] as string)
-          : randomUUID();
-
-      const pending = deps.getPendingReplies();
-      if (pending === undefined) {
-        return { content: [{ type: 'text', text: 'peers not started.' }] };
-      }
-
-      let resolve!: (body: string) => void;
-      let reject!: (err: Error) => void;
-      const promise = new Promise<string>((res, rej) => {
-        resolve = res;
-        reject = rej;
-      });
-      pending.set(replyTo, { resolve, reject });
-
-      try {
-        const receipt = await deps.send(to, message, {
-          ownName: deps.ownName(),
-          hop: deps.getHop(to),
-          isReply: false,
-          listPeers: deps.listPeers,
-          replyTo,
-        });
-
-        const queueable =
-          receipt.startsWith('Delivered to') ||
-          receipt.startsWith('Held at') ||
-          receipt.startsWith('Queued at');
-
-        if (!queueable) {
-          // Not a queueable delivery — e.g. unknown peer, refused, or it
-          // matched a pending request on the far end and was consumed.
-          pending.delete(replyTo);
-          reject(new Error('not delivered'));
-          return { content: [{ type: 'text', text: receipt }] };
-        }
-
-        if (!pending.has(replyTo)) {
-          // A very fast reply already arrived and resolved before sendToPeer
-          // returned; the promise is already resolved.
-          const body = await promise;
-          return { content: [{ type: 'text', text: `Reply from ${to}: ${body}` }] };
-        }
-
-        const entry = pending.get(replyTo)!;
-        entry.timer = setTimeout(() => {
-          if (pending.has(replyTo)) {
-            pending.delete(replyTo);
-            reject(new Error('timeout'));
-          }
-        }, timeoutMs);
-
-        const body = await promise;
-        return { content: [{ type: 'text', text: `Reply from ${to}: ${body}` }] };
-      } catch (err) {
-        pending.delete(replyTo);
-        if (err instanceof Error && err.message === 'timeout') {
-          const now = deps.getNow?.() ?? Date.now();
-          const hint = await statusHintFor(to, deps.listPeers, now);
-          return { content: [{ type: 'text', text: `Request to ${to} timed out after ${timeoutMs}ms. ${hint}` }] };
-        }
-        return { content: [{ type: 'text', text: `peer_request failed: ${err instanceof Error ? err.message : String(err)}` }] };
+        return textResult(`peer_status failed: ${errText(err)}`);
       }
     },
   });

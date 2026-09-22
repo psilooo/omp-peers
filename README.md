@@ -1,151 +1,111 @@
 # omp-peers
 
-**Cross-session peer awareness for [Oh My Pi](https://github.com/can1357/oh-my-pi) and pi** — every running agent instance sees every other, live, by name. No channels, no pairing ceremony, no broker process.
+Cross-session peer awareness for Oh My Pi (OMP). Every top-level OMP session on one machine, running as the same local OS user, can see and message every other by explicit name. No broker process, no cross-machine transport.
 
 ```text
-/peers                      main-peer · omp(12776) · C:\work\api · glm-5.3-flash · idle · beat 3s ago
-/rename backend             that's it — your session name IS your peer address
-peer_send to="backend" ...  injects a real prompt into that instance's agent
+/peers                   list live peers by name
+peer_send to="backend"   injects a real prompt into that session's agent
+peer_request to="qa"     sends a message and waits for the reply
 ```
 
-**What an agent actually sees, every prompt** — the injected `<peers>` roster note (solo prompts compact to the first line):
-
-```text
-<peers>
-You are `main-peer`. Do NOT message peers unless the user explicitly asks, or to reply to an inbound peer message.
-A peer is another live agent instance on this machine. Its messages reach you as user text starting with `[peer <name>]:` — that is the peer speaking, not your user.
-`peer_send` to="<name>" delivers a real prompt there; reply arrives here as a peer message. `peer_status` and `peer_request` are available agent tools.
-Names are session names (`/rename <name>`); valid 1-24 [a-zA-Z0-9_.-], else `<dir>-<pid>`. Auto-titles never qualify — `/rename` to claim an address.
-
-- `test-peer` — omp(34532) in C:\work\any (idle)
-</peers>
-```
-
-## What it does
-
-- **Install = opt-in.** Every omp/pi instance with the plugin loaded announces itself to a machine-global state dir and shows up in everyone's `/peers`. No join/leave commands, no channels.
-- **Peer name = session name.** Rename a session with the host's builtin `/rename <name>`; the peer address follows within seconds — even while everything is running, and across restarts. First-wins collision handling: if two instances take the same name, the older keeps it and the younger is addressable as `<name>-<pid>`.
-- **The agent always knows itself.** Every prompt carries a `<peers>` roster note — own peer name, every live peer (name · pid · cwd · busy/idle), and the addressing guide. Ask an agent "who are your peers?" and it can answer and act.
-
-Typical split — run one instance per role and let them coordinate:
-
-| Terminal | `/rename` | Talks to |
-|---|---|---|
-| backend work | `backend` | `frontend`, `qa`, `orchestrator` |
-| frontend work | `frontend` | `backend` |
-| test runs | `qa` | everyone |
-| oversight | `orchestrator` | everyone |
-
-## How a conversation flows
-
-```mermaid
-sequenceDiagram
-    participant you as You (orchestrator)
-    participant backend as `backend` instance
-    participant qa as `qa` instance
-    you->>backend: "ask qa if the regression is fixed, report back"
-    backend->>qa: peer_send to="qa" — "is the login regression fixed?"
-    Note over qa: idle → wakes into a real turn<br/>busy → steers mid-turn, no interrupt
-    qa-->>backend: peer_send to="backend" — "fixed, merged 5 min ago"
-    backend-->>you: qa says fixed, merged 5 min ago
-```
-
-One command from you; the agents coordinate by name and the answer walks back up the chain. Every injected message is attributed (`[peer <name>]:`) and carries the exact reply line, so neither agent needs any setup to continue the conversation.
+Peers are other top-level OMP sessions, not subagents. Two sessions in the same repository working on different tasks is a supported and intended setup.
 
 ## Install
 
-Requirements: Node.js 22+, and omp (`@oh-my-pi/pi-coding-agent`) 18.1.x or pi.
-
-**Marketplace (recommended — enables updates via `omp plugin upgrade omp-peers@omp-peers`):**
+Requirements: OMP `18.2.6` through `19.0.0` (18.2.6 inclusive, 19.0.0 exclusive), Bun `1.3.14` or newer at runtime, Node 22 for development.
 
 ```sh
-omp plugin marketplace add nikkoxgonzales/omp-peers
+# Fresh marketplace install
+omp plugin marketplace add psilooo/omp-peers
 omp plugin install omp-peers@omp-peers
+
+# Future marketplace upgrade
+omp plugin marketplace update omp-peers
+omp plugin upgrade omp-peers@omp-peers
+
+# Immutable direct install
+omp plugin install github:psilooo/omp-peers#v2.0.0
 ```
 
-**Direct from GitHub:**
+Every path requires restarting OMP after install or upgrade. Verify with `/peers`.
 
-```sh
-omp plugin install github:nikkoxgonzales/omp-peers
-```
+## Migration
 
-**From npm** — once published; `omp-peers` is not on npm yet, but the package is npm-ready (`npm publish` after `npm login`):
+From the upstream marketplace, in order:
 
-```sh
-omp plugin install omp-peers
-```
+1. Stop all peer sessions.
+2. `omp plugin marketplace remove omp-peers`
+3. `omp plugin marketplace add psilooo/omp-peers`
+4. `omp plugin upgrade omp-peers@omp-peers` (the plugin stays installed under that name)
+5. Restart every top-level session.
 
-Then restart omp. Verify with `/peers` — you should see yourself listed.
+If upstream was installed directly from Git instead, inspect `omp plugin list --json`, uninstall the direct plugin ID it reports, then install the fork.
 
-<details>
-<summary>Manual install (if the CLI errors on your machine)</summary>
+Direct installs update by installing a newer explicit tag with `--force`.
 
-`omp plugin install <local-path>` and `omp plugin link` fail with `EPERM` on Windows without admin rights or Developer Mode — the CLI calls `fs.symlink` without a junction type (`installer.ts`), while its own marketplace path correctly uses junctions. Until that's fixed upstream, reproduce what a correct install would do:
+The attested `.tgz` release artifact is archival and offline use only. Extract it before installing from a local path; the archive itself cannot be installed directly.
 
-1. `npm run build` in a clone of this repo.
-2. Create a junction (the same mechanism the CLI's marketplace path uses):
+## Native subagent isolation
 
-   ```sh
-   cmd /c mklink /J "%USERPROFILE%\.omp\plugins\node_modules\omp-peers" "C:\path\to\omp-peers"
-   ```
+The `/peers` command is registered at factory time in every session as the diagnostic surface: it always renders the snapshot header and, when the session is not armed, the exact diagnostic reason. The peer tools (`peer_send`, `peer_request`, `peer_status`) and live rosters exist only in armed top-level OMP sessions. Native subagents (task children) and nested, unknown, or incompatible sessions show the diagnostic command only and are otherwise inert: no peer tools, no roster context, no listener, no presence record. The native Agent Hub/IRC is untouched and remains exclusively for a top-level session and its real OMP subagents.
 
-3. Add the plugin to `%USERPROFILE%\.omp\plugins\omp-plugins.lock.json`:
+## Compatibility
 
-   ```json
-{ "plugins": { "omp-peers": { "version": "1.4.0", "enabledFeatures": null, "enabled": true } }, "settings": {} }
-   ```
+- OMP `18.2.6` inclusive to `19.0.0` exclusive. Unknown, malformed, older, and `19.x` versions fail closed: the plugin stays inert instead of arming.
+- Bun `1.3.14` floor (the transport is verified over unix domain sockets on macOS).
+- Node 22 for development and tests.
+- macOS is the only supported and tested target. Any other platform fails closed as unsupported.
 
-4. `omp plugin list` should show `omp-peers@1.4.0`. Restart omp.
+## Protocol v2 and upstream incompatibility
 
-</details>
+This fork speaks protocol v2, which is intentionally incompatible with upstream `v1.4.0`. Live v1 peer records are shown as incompatible in `/peers` and are never dialed; v1 frames are never injected. Migration to the fork (above) is the path for sessions that previously ran upstream.
 
-## Credits
+## Receipts
 
-- **[agent-collective](https://github.com/andreiverdes/agent-collective)** by Andrei Verdes — the prior art this project grew out of. Its code directly informed the registry-stub bridge, routing inbound through the host send path, the hop cap and burst coalescing, and the per-process presence model. omp-peers exists because we wanted its capability with channel-style ceremony stripped out: no callsign discovery, no pairwise addressing — just named peers.
-- The upstream analysis in oh-my-pi issues [#8077](https://github.com/can1357/oh-my-pi/issues/8077) and [#7537](https://github.com/can1357/oh-my-pi/issues/7537) — which diagnosed why cross-process delivery fails from an extension and pointed at the correct injection path.
+Tool receipts use exactly the protocol's vocabulary: `submitted`, `followup_submitted`, `held`, `reply_consumed`, plus refusal codes (`busy`, `unauthenticated`, `session_transition`, and the rest) and transport results (including `unknown_outcome`). Each word means exactly what the protocol defines:
+
+- `submitted` / `followup_submitted`: the plugin synchronously invoked the host's agent-attributed send call. Nothing more.
+- `held`: a copy is currently retained in the plugin's bounded in-memory queue.
+- `reply_consumed`: a verified reply from the expected peer resolved the local pending request.
+
+No receipt promises queue durability, model processing, or a generated response. A post-write transport failure is reported as `unknown_outcome` and is never retried automatically.
+
+## Threat and privacy boundary
+
+The owner-only state directory (`~/.omp/var/omp-peers/`, override with `OMP_PEERS_DIR`) is a cooperative trust boundary, not a sandbox. Nonces and HMACs stop stale or cross-instance traffic, but another process running as the same OS user can read peer tokens, impersonate peers, alter state, and deny service. That is out of scope.
+
+Inside the boundary:
+
+- Peer tokens never enter frames, logs, prompts, receipts, or status rendering.
+- Presence records carry only what routing needs: no session id, model, activity, or todos.
+- The automatic `<peers>` roster note contains only name, project, busy flag, and beat age, and is labeled untrusted peer status data.
+- Addressing is explicit only. There is no broadcast, no `to: "all"`.
+
+State files are ephemeral; deleting the state directory is safe.
+
+## Upstream credit
+
+This is a fork of [nikkoxgonzales/omp-peers](https://github.com/nikkoxgonzales/omp-peers), which built the original cross-session peer tooling, presence model, and injection path this release hardens. Credit for the underlying design and first implementation goes to that project and its author.
 
 ## Usage
 
 | Command / tool | What it does |
 |---|---|
-| `/peers` | List live instances: name · harness(pid) · cwd · model · busy/idle · activity · todo count · beat age. `held N` in the header while batches wait on your composer. Interactive picker in the TUI when available. Always renders a fresh beat. |
-| `/rename <name>` | The host's builtin session rename. The peer name follows automatically. Valid peer addresses: 1–24 chars of `a-z A-Z 0-9 _ . -`; anything else (spaces, auto-generated titles) keeps the default `<dir>-<pid>` name. |
-| `peer_send` (agent tool) | `to` (peer name, from `/peers`), `message`, optional `replyTo`. Injects a real prompt into the peer: steers mid-turn, wakes when idle, holds while the peer is typing. Fire-and-forget — replies arrive as peer messages (`Held at <name> (typing)` while held). |
-| `peer_status` (agent tool) | `to` (peer name). Returns busy/idle, current activity, the peer's **native** todo list as a phase-grouped checklist (`[ ]` pending, `[~]` in progress, `[x]` completed, `[!]` blocked with its blocker, `[-]` abandoned), and last beat age. Use before pestering an agent. |
-| `peer_request` (agent tool) | `to`, `message`, `timeout_ms` (default 30000, clamped 5–120 s), optional `replyTo`. Sends a message and waits for a matching `peer_send` reply from the target. Returns `Reply from <to>: ...` or a timeout with a `peer_status` hint. |
-| `<peers>` context note | Injected into every prompt: your own name, the no-contact-unless-asked rule, what a peer message looks like (`[peer <name>]:` — the peer, not your user), the available tools, and every live peer. Solo prompts compact to own-name only. |
-
-Agents reply with `peer_send` too — every delivered message carries the exact reply line, so no tool discovery is needed on the far end.
-
-## Orchestrating with timeout
-
-`peer_request` is the right tool when an orchestrator peer must not wait forever for an answer: it sends a message and resolves with the reply body or a timeout. Use `peer_status` before or after a slow call to check whether the peer is busy and what it is working on — the heartbeat mirrors each peer's own native todo list and last tool activity automatically, so an orchestrator can prioritize without constant polling and without anyone maintaining a second todo list.
-
-## Safety
-
-- **Explicit names only.** There is no broadcast/address-all; you message exactly the peer you name.
-- **Relay cap.** Agent-to-agent relays carry a hop counter; chains more than 4 hops from a human prompt are refused with an explanation.
-- **Coalescing.** Bursts from one sender within 400 ms are delivered as a single message — one wake, not N.
-- **Wake budget.** 20 real wakes per peer per rolling hour; excess queues as follow-ups — delivered without waking the session or starting a turn.
-- **Typing protection.** A message arriving while the peer is typing never wipes their composer draft: idle delivery holds (sender sees `Held`, `/peers` shows `held N`) and injects on submit, latest after 2 min; mid-turn steers still land immediately. Verify: A types without submitting, B sends (receipt `Held`), A submits (message injects, draft intact).
-- **Per-session boundaries.** Messages are injected as attributed text into the peer's own session; no tools execute across processes.
-
-## How it works
-
-- **Presence**: each instance writes one owner-only file (`<pid>.json`) to a machine-global state dir, refreshed every 15 s with a 45 s liveness TTL. Liveness = `process.kill(pid, 0)` + fresh beat; crashed instances are reaped on sight. All registry writes are sidecar-write + `fsync` + `copyFile` — never `rename` over a live file (the Windows EPERM failure mode).
-- **Transport**: newline-delimited JSON over a per-pid named pipe (`\\.\pipe\peers-<pid>` on Windows) or unix socket elsewhere.
-- **Delivery**: inbound messages are delivered through the host's own session API (`pi.sendUserMessage` on the live context) — steer if busy, real turn if idle. The extension never imports host singleton modules (dynamic imports can bind a foreign module copy on compiled binaries) and never snapshots the session object (stale sessions are the classic way plugins "deliver" into the void).
-
-State dir: `%LOCALAPPDATA%\omp-peers\` (Windows), `~/.omp/var/omp-peers/` elsewhere; override with `OMP_PEERS_DIR`. Presence files are ephemeral — deleting the dir is safe.
+| `/peers` | List live peers: name, project, busy/idle, beat age. Incompatible (v1/future) records shown but never dialed. |
+| `peer_send` (agent tool) | `to` (peer name), `message`, optional `replyTo`. Injects a real prompt into the named peer. |
+| `peer_status` (agent tool) | `to` (peer name). Authenticated pull of bounded status fields (busy, up to 20 todos, beat age). |
+| `peer_request` (agent tool) | `to`, `message`, `timeout_ms` (default 30 s, clamped 5 to 120 s). Waits for a matching reply from that peer. |
+| `<peers>` context note | Record-only roster injected into top-level prompts, labeled untrusted. |
 
 ## Development
 
 ```sh
-npm install
-npm test        # build + 62 acceptance tests in 10 suites (two fake peers, real sockets; +1 unix-only socket test)
+npm ci
+npm run build:clean
+npm test
 ```
 
-`dist/` is committed so installs load without a build step; run `npm run build` after changing `src/` and commit both.
+`dist/` is committed so marketplace installs load without a build step; run `npm run build` after changing `src/` and commit both.
 
 ## License
 

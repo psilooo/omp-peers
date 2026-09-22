@@ -1,20 +1,30 @@
 /**
- * `/peers` — list live instances: name · harness(pid) · cwd · model ·
- * busy/idle · beat age. Text list always; the interactive picker runs ONLY
- * when `typeof ctx.ui?.select === 'function' && ctx.mode === 'tui'`, else
- * plain text. No UI module is ever imported — the primitive is probed on the
- * live ctx and invoked as a receiver method.
+ * `/peers` - sanitized text list of the peer snapshot: routable rows, held
+ * count, incompatible v1/future rows (shown, never dialed), and the armed or
+ * diagnostic state. The interactive picker runs only when `ctx.ui.select` is
+ * callable and `ctx.mode === 'tui'`; the text list always renders otherwise.
+ * Every untrusted field passes `sanitizeDisplay` with bounds from the
+ * protocol constants, so status data cannot escape the rendering.
  */
 import type { ExtensionHostLike } from '../peers/host.js';
-import type { PeerRecord } from '../types.js';
+import type { RosterRow } from '../peers/roster.js';
 export interface PeersSnapshot {
-    ownName: string;
-    mode: 'hub' | 'tools';
-    peers: PeerRecord[];
-    /** Batches held while the peer types — shown so held mail is visible. */
-    held?: number;
+    self: {
+        name: string;
+        project: string;
+    };
+    rows: RosterRow[];
+    /** Live v1/future records: shown as incompatible, never dialed. */
+    incompatible: Array<{
+        pid: number;
+        version: number;
+    }>;
+    held: number;
+    armed: boolean;
+    /** Exact diagnostic text when not armed. */
+    diagnostic?: string;
 }
-/** `backend · omp(1234) · C:\work · model-id · working · beat 3s ago`. */
-export declare function formatPeerLine(p: PeerRecord, now: number, selfName: string): string;
+/** `` `name` · project · working · beat 3s ago · model ... · you `` */
+export declare function formatPeerLine(row: RosterRow, selfName: string): string;
 export declare function formatPeersText(snap: PeersSnapshot, now: number): string;
 export declare function registerPeersCommand(pi: ExtensionHostLike, getSnapshot: () => Promise<PeersSnapshot>): void;

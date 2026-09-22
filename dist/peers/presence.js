@@ -1,247 +1,241 @@
 /**
- * Presence — one owner-written heartbeat file per peer process.
+ * Presence v2: one owner-written heartbeat record per peer process under
+ * <roots.peersDir>. Reads are bounded and ownership-checked; retention
+ * follows plan section 3 exactly:
  *
- * `<state>/peers/<pid>.json` is written via `durableWriteJson` (sidecar +
- * fsync + copy-over, never a rename over a live file) on a 15s beat. A peer
- * is live while its beat is at most 45s old AND its pid answers
- * `process.kill(pid, 0)`. Stale records are reaped (unlinked on sight).
- * Shutdown unlinks the own record.
+ *  - a beat is fresh through exactly PRESENCE_TTL_MS and expired just after;
+ *  - only an ESRCH pid probe may unlink a record (and, for an exact v2
+ *    (pid, instance) pair, its derived endpoint); EPERM, access denied, and
+ *    unknown probe errors mean alive/unknown, so the record is retained;
+ *  - expired or malformed records owned by a live pid are ignored, retained,
+ *    and never dialed;
+ *  - future versions are ignored, never deleted; live v1 records are shown
+ *    as incompatible and never dialed; a dead v1 record may be removed but
+ *    its legacy PID-only socket is never unlinked automatically;
+ *  - every path comes from the trusted roots plus a validated (pid,
+ *    instance), never from record content.
  */
-import { chmod, readdir, rm, stat } from 'node:fs/promises';
-import { basename, join } from 'node:path';
-import { durableWriteJson, readJsonFile } from '../store/atomic.js';
-import { peerPath, peersDir } from '../store/paths.js';
-export const HEARTBEAT_MS = 15_000;
-export const PEER_TTL_MS = 45_000;
-/** Field shape shared by every schema version (version gate lives in isPeerRecord). */
-function hasPeerRecordShape(value) {
-    if (typeof value !== 'object' || value === null)
-        return false;
-    const r = value;
-    return (typeof r['pid'] === 'number' &&
-        typeof r['name'] === 'string' &&
-        typeof r['cwd'] === 'string' &&
-        (r['harness'] === 'omp' || r['harness'] === 'pi') &&
-        typeof r['socket'] === 'string' &&
-        typeof r['startedAt'] === 'number' &&
-        typeof r['beatAt'] === 'number');
-}
-function isPeerRecord(value) {
-    return hasPeerRecordShape(value) && value['v'] === 1;
-}
-function defaultIsAlive(pid) {
+import { lstat, opendir, unlink } from 'node:fs/promises';
+import { join } from 'node:path';
+import { durableWriteJson, readJsonBounded } from '../store/atomic.js';
+import { peerEndpoint, peerRecordPath } from '../store/paths.js';
+import { MAX_DIR_ENTRIES, MAX_ROUTABLE_PEERS, RECORD_MAX_BYTES, isCanonicalInstance, isRecordFresh, parseRecord, } from './protocol.js';
+const PID_MAX = 2147483647;
+const V2_ENTRY_NAME = /^([1-9]\d*)-([0-9a-f]{32})\.json$/;
+const V1_ENTRY_NAME = /^([1-9]\d*)\.json$/;
+/** Signal 0 probe: ESRCH is the only ground for `dead`; EPERM means alive. */
+function probePid(pid) {
+    if (!Number.isInteger(pid) || pid < 1 || pid > PID_MAX) {
+        return 'unknown';
+    }
     try {
         process.kill(pid, 0);
-        return true;
+        return 'alive';
+    }
+    catch (err) {
+        const code = err.code;
+        if (code === 'ESRCH')
+            return 'dead';
+        if (code === 'EPERM')
+            return 'alive';
+        return 'unknown';
+    }
+}
+/** True only for a regular, non-symlink file that is ours and owner-only on POSIX. */
+async function recordFileOk(path) {
+    let stats;
+    try {
+        stats = await lstat(path);
     }
     catch {
         return false;
     }
+    if (!stats.isFile()) {
+        // lstat: symlinks, sockets, and directories are all non-files.
+        return false;
+    }
+    const uid = process.getuid?.();
+    if (uid === undefined || stats.uid !== uid) {
+        return false;
+    }
+    return (stats.mode & 0o077) === 0;
 }
-/** Write (or refresh) this process's presence record. Owner-only writer. */
-export async function writePeerBeat(input) {
-    const pid = input.pid ?? process.pid;
-    const record = {
-        v: 1,
-        pid,
-        name: input.name,
-        cwd: input.cwd,
-        project: basename(input.cwd),
-        harness: input.harness,
-        sessionId: input.sessionId ?? '',
-        model: input.model ?? '',
-        socket: input.socket,
-        startedAt: input.startedAt,
-        beatAt: Date.now(),
-        busy: input.busy ?? false,
-    };
-    if (input.activity !== undefined && input.activity !== '') {
-        record.activity = input.activity;
-    }
-    if (input.todos !== undefined && input.todos.length > 0) {
-        record.todos = input.todos;
-    }
-    const file = peerPath(pid, input.stateDir);
-    // chmod only on first write — the file keeps its mode across refreshes,
-    // so re-chmodding every 15s beat is wasted syscalls.
-    let isNew = true;
+async function unlinkQuiet(path) {
     try {
-        await stat(file);
-        isNew = false;
+        await unlink(path);
     }
     catch {
-        isNew = true;
+        // Absent or not removable; cleanup paths never propagate errors.
     }
-    await durableWriteJson(file, record);
-    if (isNew) {
-        try {
-            await chmod(file, 0o600);
+}
+function parseEntryName(name) {
+    const v2 = V2_ENTRY_NAME.exec(name);
+    if (v2 !== null) {
+        const pid = Number(v2[1]);
+        return pid <= PID_MAX ? { pid, instance: v2[2] } : undefined;
+    }
+    const v1 = V1_ENTRY_NAME.exec(name);
+    if (v1 !== null) {
+        const pid = Number(v1[1]);
+        return pid <= PID_MAX ? { pid, instance: null } : undefined;
+    }
+    return undefined;
+}
+/** Apply every scan acceptance and retention rule to one directory entry. */
+async function classifyEntry(roots, self, now, name) {
+    const id = parseEntryName(name);
+    if (id === undefined) {
+        return undefined;
+    }
+    const legacy = id.instance === null;
+    const recordPath = legacy ? join(roots.peersDir, name) : peerRecordPath(roots, id.pid, id.instance ?? '');
+    const isSelf = id.instance !== null && id.pid === self.pid && id.instance === self.instance;
+    const liveness = isSelf ? 'alive' : probePid(id.pid);
+    const readable = await recordFileOk(recordPath);
+    const raw = readable ? await readJsonBounded(recordPath, RECORD_MAX_BYTES) : undefined;
+    const parsed = raw === undefined ? undefined : parseRecord(raw);
+    if (liveness === 'dead') {
+        // Never delete a future version, and never delete what cannot be read:
+        // either could belong to a newer plugin.
+        if (raw === undefined || parsed === undefined || parsed.kind === 'future') {
+            return undefined;
         }
-        catch {
-            // Best effort: the parent dir is already mode-restricted on creation.
+        await unlinkQuiet(recordPath);
+        if (id.instance !== null) {
+            await unlinkQuiet(peerEndpoint(roots, id.pid, id.instance));
         }
+        return undefined;
+    }
+    if (parsed === undefined) {
+        return undefined;
+    }
+    if (parsed.kind === 'future') {
+        return { kind: 'incompatible', pid: id.pid, version: parsed.version };
+    }
+    if (legacy) {
+        return parsed.kind === 'v1' ? { kind: 'incompatible', pid: id.pid, version: 1 } : undefined;
+    }
+    if (parsed.kind !== 'v2') {
+        // Filename/content identity mismatch or malformed body: ignore, retain.
+        return undefined;
+    }
+    const record = parsed.record;
+    if (record.pid !== id.pid || record.instance !== id.instance) {
+        return undefined;
+    }
+    if (!isRecordFresh(record.beatAt, now)) {
+        return undefined;
+    }
+    return { kind: 'routable', record };
+}
+/** Write (or refresh) this process's record atomically at 0600 on POSIX. */
+export async function writeOwnRecord(roots, record) {
+    if (!Number.isInteger(record.pid) || record.pid < 1 || record.pid > PID_MAX) {
+        throw new Error('refusing to write a presence record with an out-of-range pid');
+    }
+    if (!isCanonicalInstance(record.instance)) {
+        throw new Error('refusing to write a presence record with a non-canonical instance');
+    }
+    await durableWriteJson(peerRecordPath(roots, record.pid, record.instance), record, {
+        pretty: false,
+        mode: 0o600,
+    });
+}
+/**
+ * Bounded directory scan: at most MAX_DIR_ENTRIES entries examined, each
+ * record read through an 8 KiB bound after regular/non-symlink/owner/mode
+ * checks. Never throws; a missing or unreadable directory yields an empty
+ * scan.
+ */
+export async function scanPeers(roots, self, now = Date.now()) {
+    const routable = [];
+    const incompatible = [];
+    let handle;
+    try {
+        handle = await opendir(roots.peersDir);
+    }
+    catch {
+        return { routable, incompatible };
+    }
+    let seen = 0;
+    try {
+        for await (const entry of handle) {
+            if (seen >= MAX_DIR_ENTRIES) {
+                break;
+            }
+            seen += 1;
+            try {
+                const outcome = await classifyEntry(roots, self, now, entry.name);
+                if (outcome === undefined) {
+                    continue;
+                }
+                if (outcome.kind === 'incompatible') {
+                    incompatible.push({ pid: outcome.pid, version: outcome.version });
+                }
+                else if (routable.length < MAX_ROUTABLE_PEERS) {
+                    routable.push(outcome.record);
+                }
+            }
+            catch {
+                // One bad entry never aborts or fails the scan.
+            }
+        }
+    }
+    catch {
+        // Iteration failure returns whatever was classified so far.
+    }
+    return { routable, incompatible };
+}
+/**
+ * Read a single record under exactly the scan acceptance rules (8 KiB bound,
+ * regular/non-symlink/owner/mode, identity match, freshness, live pid).
+ * Returns undefined when unusable, stale, or the pid is provably dead.
+ */
+export async function readPeerRecord(roots, pid, instance, now = Date.now()) {
+    if (!Number.isInteger(pid) || pid < 1 || pid > PID_MAX) {
+        return undefined;
+    }
+    if (!isCanonicalInstance(instance)) {
+        return undefined;
+    }
+    const path = peerRecordPath(roots, pid, instance);
+    if (!(await recordFileOk(path))) {
+        return undefined;
+    }
+    const raw = await readJsonBounded(path, RECORD_MAX_BYTES);
+    if (raw === undefined) {
+        return undefined;
+    }
+    const parsed = parseRecord(raw);
+    if (parsed.kind !== 'v2') {
+        return undefined;
+    }
+    const record = parsed.record;
+    if (record.pid !== pid || record.instance !== instance) {
+        return undefined;
+    }
+    if (!isRecordFresh(record.beatAt, now)) {
+        return undefined;
+    }
+    if (probePid(pid) === 'dead') {
+        return undefined;
     }
     return record;
 }
 /**
- * List live peers, reaping stale records on sight: wrong-shape files, dead
- * pids, and beats older than the TTL are unlinked. Unparseable files are
- * left alone (torn reads), as are well-shaped records from a newer schema
- * version. A unix socket is unlinked only when its pid is confirmed dead —
- * a live peer keeps its socket even on a stale beat — and orphan
- * `<pid>.sock` files with no live owner are reaped too. Results sort by name.
+ * Remove only this process's exact (pid, instance) record and its derived
+ * endpoint. Invalid identity arguments are ignored rather than resolved into
+ * a path; unlink failures never propagate.
  */
-export async function listLivePeers(stateDir, selfPid, opts = {}) {
-    const dir = peersDir(stateDir);
-    let names;
-    try {
-        names = await readdir(dir);
+export async function removeOwnRecord(roots, pid, instance) {
+    if (!Number.isInteger(pid) || pid < 1 || pid > PID_MAX) {
+        return;
     }
-    catch {
-        return [];
+    if (!isCanonicalInstance(instance)) {
+        return;
     }
-    const now = opts.now ?? Date.now();
-    const isAlive = opts.isAlive ?? defaultIsAlive;
-    const live = [];
-    const sockNames = [];
-    for (const name of names) {
-        if (name.endsWith('.sock')) {
-            sockNames.push(name);
-            continue;
-        }
-        if (!name.endsWith('.json'))
-            continue;
-        const file = join(dir, name);
-        let parsed;
-        try {
-            parsed = await readJsonFile(file, { retries: 1, retryDelayMs: 50 });
-        }
-        catch {
-            continue;
-        }
-        if (!isPeerRecord(parsed)) {
-            // Forward-compat: a well-shaped record with a newer `v` is skipped,
-            // not unlinked — a future peer owns it. Malformed files get reaped.
-            if (!(hasPeerRecordShape(parsed) && typeof parsed['v'] === 'number' && parsed['v'] > 1)) {
-                await rm(file, { force: true }).catch(() => undefined);
-            }
-            continue;
-        }
-        if (parsed.pid !== selfPid) {
-            let alive = true;
-            try {
-                alive = isAlive(parsed.pid);
-            }
-            catch {
-                alive = false;
-            }
-            if (!alive || now - parsed.beatAt > PEER_TTL_MS) {
-                await rm(file, { force: true }).catch(() => undefined);
-                // Only a confirmed-dead pid loses its socket: a live process with a
-                // stalled beat keeps it — unlinking a live peer's socket would
-                // strand it (ENOENT forever); its next beat rewrites the record.
-                if (!alive && process.platform !== 'win32' && parsed.socket.startsWith(`${dir}/`)) {
-                    await rm(parsed.socket, { force: true }).catch(() => undefined);
-                }
-                continue;
-            }
-        }
-        live.push(parsed);
-    }
-    if (process.platform !== 'win32') {
-        // Orphan sockets: a dead pid's `<pid>.sock` survives record reaping when
-        // the record was already gone. Skip names that don't parse to a pid.
-        const livePids = new Set(live.map((p) => p.pid));
-        for (const name of sockNames) {
-            const base = name.slice(0, -'.sock'.length);
-            if (!/^\d+$/.test(base))
-                continue;
-            const pid = Number(base);
-            if (livePids.has(pid))
-                continue;
-            let alive = true;
-            try {
-                alive = isAlive(pid);
-            }
-            catch {
-                alive = false;
-            }
-            if (!alive)
-                await rm(join(dir, name), { force: true }).catch(() => undefined);
-        }
-    }
-    live.sort((a, b) => a.name.localeCompare(b.name));
-    return live;
-}
-/** Remove one presence record (+ its unix socket on non-Windows, dead pids only). */
-export async function removePeerRecord(stateDir, pid, opts = {}) {
-    const dir = peersDir(stateDir);
-    await rm(join(dir, `${pid}.json`), { force: true }).catch(() => undefined);
-    // The socket belongs to the pid, not the record: unlinking a live pid's
-    // socket strands it. A live owner's own cleanup runs via server.stop().
-    let alive = true;
-    try {
-        alive = (opts.isAlive ?? defaultIsAlive)(pid);
-    }
-    catch {
-        alive = false;
-    }
-    if (process.platform !== 'win32' && !alive) {
-        await rm(join(dir, `${pid}.sock`), { force: true }).catch(() => undefined);
-    }
-}
-/**
- * Run `tick` immediately and every `intervalMs`. The tick body never throws
- * into the host: failures route to `onError`. Returns a `stop` handle.
- */
-export function startPresenceBeat(tick, opts = {}) {
-    const intervalMs = opts.intervalMs ?? HEARTBEAT_MS;
-    const guarded = () => {
-        try {
-            const out = tick();
-            if (out !== undefined && typeof out.catch === 'function') {
-                out.catch((err) => {
-                    try {
-                        opts.onError?.(err);
-                    }
-                    catch {
-                        // Error reporting never throws into the timer.
-                    }
-                });
-            }
-        }
-        catch (err) {
-            try {
-                opts.onError?.(err);
-            }
-            catch {
-                // Error reporting never throws into the timer.
-            }
-        }
-    };
-    if (typeof opts.setInterval === 'function' && typeof opts.clearTimer === 'function') {
-        const timer = opts.setInterval(guarded, intervalMs);
-        const clearTimer = opts.clearTimer;
-        guarded();
-        return {
-            stop: () => {
-                try {
-                    clearTimer(timer);
-                }
-                catch {
-                    // Stop never throws.
-                }
-            },
-        };
-    }
-    const timer = setInterval(guarded, intervalMs);
-    timer.unref?.();
-    guarded();
-    return {
-        stop: () => {
-            clearInterval(timer);
-        },
-    };
+    await unlinkQuiet(peerRecordPath(roots, pid, instance));
+    await unlinkQuiet(peerEndpoint(roots, pid, instance));
 }
 /** `3s ago` / `12m ago` / `2h ago` for the `/peers` beat-age column. */
 export function formatBeatAge(beatAt, now = Date.now()) {

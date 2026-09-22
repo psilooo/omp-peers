@@ -1,33 +1,28 @@
 /**
- * Agent tool surface: `peer_send`, `peer_status`, and `peer_request`.
+ * Agent tool surface: `peer_send`, `peer_request`, and `peer_status`.
  *
- * Registered UNCONDITIONALLY in every mode: on omp hosts the bridge carries
- * peers as native `hub` refs, but those are best-effort (the bridge may bind
- * a foreign registry copy on compiled hosts), so `peer_send {to, message,
- * replyTo?}` is THE guaranteed agent path everywhere. `peer_status` reads the
- * heartbeat, which mirrors each peer's NATIVE todo list and current activity —
- * there is no peer-owned todo to maintain. Explicit names only — `to:"all"`
- * is refused.
+ * Explicit peer names only - `to:"all"` is refused by the outbound pipeline.
+ * Every execute handler returns text and never throws. Results render through
+ * `renderReceipt`, which prints the protocol machine codes verbatim
+ * (`submitted`, `followup_submitted`, `held`, `reply_consumed`, `status`,
+ * `pong`, every refusal and local transport code) and never claims more than
+ * the plugin synchronously did.
  */
 import type { ExtensionHostLike } from './peers/host.js';
-import type { OutboundDeps } from './peers/outbound.js';
-import type { PeerRecord, PendingReply } from './types.js';
-export interface PeerSendDeps {
-    send: (to: string, message: string, replyTo?: string) => Promise<string>;
+import type { OutboundResult } from './peers/outbound.js';
+export interface PeerToolDeps {
+    send(to: string, body: string, opts: {
+        replyTo?: string;
+    }): Promise<OutboundResult>;
+    request(to: string, body: string, opts: {
+        timeoutMs?: number;
+    }): Promise<OutboundResult>;
+    status(to: string): Promise<OutboundResult>;
 }
-export declare function registerPeerSendTool(pi: ExtensionHostLike, deps: PeerSendDeps): void;
-export interface PeerStatusDeps {
-    listPeers: () => Promise<PeerRecord[]>;
-    now?: () => number;
-}
-export declare function registerPeerStatusTool(pi: ExtensionHostLike, deps: PeerStatusDeps): void;
-export interface PeerRequestDeps {
-    ownName: () => string;
-    /** Hop for a request to `to` — a request is never a reply, so it may only stay level or advance. */
-    getHop: (to: string) => number;
-    send: (to: string, message: string, deps: OutboundDeps) => Promise<string>;
-    listPeers: () => Promise<PeerRecord[]>;
-    getPendingReplies: () => Map<string, PendingReply> | undefined;
-    getNow?: () => number;
-}
-export declare function registerPeerRequestTool(pi: ExtensionHostLike, deps: PeerRequestDeps): void;
+/**
+ * Render one outbound result: target plus the exact machine code vocabulary,
+ * bounded sanitized detail, and bounded status detail when present. Never
+ * substitutes softer words for a code.
+ */
+export declare function renderReceipt(to: string, result: OutboundResult): string;
+export declare function registerPeerTools(pi: ExtensionHostLike, deps: PeerToolDeps): void;

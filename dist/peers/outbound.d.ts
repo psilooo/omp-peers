@@ -1,37 +1,78 @@
 /**
- * Outbound delivery — name→socket send. Never throws into the agent turn:
- * every failure (unknown name, refused relay, dead socket, timeout) resolves
- * to a human-readable text receipt. Dead sockets reap the stale presence
- * record on sight so the next `/peers` is accurate.
+ * Outbound v2 exchange: fresh unique-name resolution, receiver-proof challenge
+ * verification before any body or credential leaves this side, phase-aware
+ * retry rules, and the pending-request correlation store. Every failure
+ * resolves to a protocol result code; nothing throws into the agent turn.
  */
-import type { PeerRecord } from '../types.js';
-/** Hop accounting state: where this node's last real inbound delivery came from. */
-export interface HopState {
-    lastInboundPeer: string | undefined;
-    lastInboundHop: number;
+import type { AcceptanceState, PeerIdentity, PeerRecordV2, ResultCode, StatusSnapshot } from './protocol.js';
+import type { PeerScan } from './presence.js';
+import type { StateRoots } from '../store/paths.js';
+import type { ManagedTimers } from './server.js';
+export interface OutboundResult {
+    code: ResultCode;
+    detail?: string;
+    replyBody?: string;
+    status?: StatusSnapshot;
+    target?: PeerIdentity;
 }
-/**
- * The hop an outbound send from `st` must carry.
- *
- * A single hop counter per node cannot tell a relay from a conversation: every
- * send would advance the chain, so an orchestrator<->agent request/reply round
- * trip hit the cap after a few rounds. Tracking the last inbound peer instead
- * keeps a conversation (or a reply) at the depth it arrived — only relaying to
- * a DIFFERENT peer advances the chain. Nothing received since the last human
- * prompt means a fresh chain: hop 0.
- */
-export declare function outboundHop(st: HopState, to: string, isReply: boolean): number;
 export interface OutboundDeps {
-    ownName: string;
-    /** Live per-node hop state; when present the hop is derived via {@link outboundHop}. */
-    state?: HopState;
-    /** True when this send answers the last inbound message (never advances the chain). */
-    isReply?: boolean;
-    /** Explicit hop override — wins over `state`. */
-    hop?: number;
-    replyTo?: string;
-    listPeers: () => Promise<PeerRecord[]>;
-    reap?: (record: PeerRecord) => Promise<void> | void;
+    identity: {
+        pid: number;
+        instance: string;
+        token: string;
+    };
+    roots: StateRoots;
+    managed: ManagedTimers;
+    scan(): Promise<PeerScan>;
+    pending: PendingStore;
+    acceptance(): AcceptanceState;
+    log(text: string): void;
 }
-/** Send one message to the peer named `to`. Never throws. */
-export declare function sendToPeer(to: string, message: string, deps: OutboundDeps): Promise<string>;
+export type ResolvedTarget = {
+    kind: 'unique';
+    record: PeerRecordV2;
+} | {
+    kind: 'missing';
+    known: string[];
+} | {
+    kind: 'ambiguous';
+    known: string[];
+} | {
+    kind: 'self';
+};
+export declare class PendingStore {
+    private readonly slots;
+    private outboundSockets;
+    /** Reserves one of the MAX_OUTBOUND_SOCKETS concurrent exchange slots. */
+    acquireSocket(): boolean;
+    /** Releases an exchange slot on every terminal path; never goes negative. */
+    releaseSocket(): void;
+    /**
+     * Reserves the slot and returns its reply promise, captured exactly once
+     * here: a settle at any later time resolves this same promise, so a reply
+     * arriving before the caller observes it is never lost.
+     */
+    reserve(id: string, expected: PeerIdentity): Promise<string> | undefined;
+    /** Called immediately before socket.write of the request line. */
+    markWritten(id: string): void;
+    /** Records an authenticated receiver refusal that proves the request never dispatched. */
+    noteNoDispatch(id: string): boolean;
+    retarget(id: string, expected: PeerIdentity): boolean;
+    settle(from: PeerIdentity, replyTo: string, body: string): boolean;
+    discard(id: string, code: ResultCode): void;
+    rejectAll(code: ResultCode): void;
+    size(): number;
+}
+export declare function resolveTarget(deps: OutboundDeps, to: string): Promise<ResolvedTarget>;
+export declare function sendMsg(deps: OutboundDeps, to: string, body: string, opts?: {
+    replyTo?: string;
+    hop?: number;
+}): Promise<OutboundResult>;
+export declare function requestMsg(deps: OutboundDeps, to: string, body: string, opts?: {
+    timeoutMs?: number;
+    hop?: number;
+}): Promise<OutboundResult>;
+export declare function statusOf(deps: OutboundDeps, to: string, fields: string[], budget?: {
+    deadlineAt: number;
+}): Promise<OutboundResult>;
+export declare function pingPeer(deps: OutboundDeps, to: string): Promise<OutboundResult>;

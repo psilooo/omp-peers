@@ -1,120 +1,139 @@
 /**
- * Inbound delivery — hand a socket message to the LOCAL agent.
+ * Inbound delivery: hand accepted peer envelopes to the LOCAL agent through
+ * the extension-host surface.
  *
- * PRIMARY PATH: `cur.pi.sendUserMessage(text)` on the CURRENT context's pi
- * with default semantics — streaming queues as steer, idle starts a turn,
- * plan mode folds it into context. No registry lookup, no own-agent-id
- * discovery, no drop-for-undiscovered: the host's bus copy is unreachable
- * from a compiled extension, so delivery goes through the extension-host
- * surface that is always live on the current context.
- *
- * STRUCTURAL RULE: the session is NEVER snapshotted at boot. The current
- * `{pi, ctx}` comes from a live getter (refreshed on every host event).
- * Over-budget wakes queue as asides
- * (`pi.sendUserMessage(text, {deliverAs:'aside'})`), as does delivery on a
- * bridgeless host — and always on the CURRENT pi, never a
- * factory-captured one.
+ * One sealed batch is one host submission joining its already-rendered
+ * bodies with newlines. Wake budgeting is per verified (pid, instance)
+ * plus one process-global ring; that ring is the only module-scoped
+ * mutable state allowed in the repo.
  */
 
-import type { InboundMessage } from './server.js';
+import type { PeerTodo } from '../types.js';
+import { readBusy, readModel, readNativeTodos } from './host.js';
 import type { CommandContextLike, ExtensionHostLike } from './host.js';
+import type { PendingStore } from './outbound.js';
+import {
+  MAX_HELD_BATCHES,
+  MAX_STATUS_ACTIVITY_BYTES,
+  MAX_STATUS_TODOS,
+  MAX_STATUS_TEXT_BYTES,
+  MAX_WAKE_IDENTITIES,
+  PROCESS_WAKES_PER_HOUR,
+  WAKE_WINDOW_MS,
+  WAKES_PER_HOUR,
+  identityKey,
+} from './protocol.js';
+import type { AcceptanceState, PeerIdentity, StatusSnapshot } from './protocol.js';
+import type { AuthenticatedEnvelope, EpochSnapshot, HostDelivery } from './server.js';
 
-/** Per-peer wakes allowed per rolling hour before excess queues as asides. */
-export const MAX_WAKES_PER_PEER_PER_HOUR = 20;
-export const WAKE_WINDOW_MS = 3_600_000;
-/** A batch held while the peer types waits at most this long before delivering anyway. */
-export const HOLD_TIMEOUT_MS = 120_000;
-/** Upper bound on batches waiting for the peer's composer to clear. */
-export const MAX_HELD_BATCHES = 20;
-/** How often a process retries its held batches. */
-export const HOLD_POLL_MS = 500;
+/** Per-verified-(pid,instance) wake budget over the rolling hour. */
+export class WakeLimiter {
+  private readonly wakes = new Map<string, number[]>();
 
-export interface InboundCarrier {
-  from: string;
-  body: string;
-  replyTo?: string;
-}
-
-export interface CurrentHost {
-  pi: ExtensionHostLike;
-  ctx: CommandContextLike;
-}
-
-/** One coalesced batch waiting for the peer's composer to clear. */
-export interface HeldBatch {
-  message: InboundMessage;
-  receivedAt: number;
-}
-
-export type InboundOutcome = 'injected' | 'woken' | 'aside' | 'dropped' | 'held';
-
-export interface InboundDeps {
-  /** Live getter for the freshest host handles — called on every delivery. */
-  getCurrent: () => CurrentHost | undefined;
-  /** Live composer text — non-empty means the peer is typing. Absent headless. */
-  getDraftText?: () => string;
-  /** When this batch first arrived — bounds how long a hold may last. */
-  receivedAt?: number;
-  /** In-memory per-peer wake timestamps; owned by the caller. */
-  wakes?: Map<string, number[]>;
-  now?: () => number;
-}
-
-/** Every injection carries the `[peer <name>]` prefix plus a peer-not-user line. */
-export function formatPeerText(from: string, body: string, opts: { replyTo?: string } = {}): string {
-  return [
-    `[peer ${from}]${opts.replyTo !== undefined && opts.replyTo !== '' ? ` (reply to ${opts.replyTo})` : ''}:`,
-    '',
-    body,
-    '',
-    // Always `peer_send`: it works on every host shape. Even in hub mode the
-    // probe may hold a foreign registry copy where `hub` op=send cannot
-    // resolve peer names — pointing replies there strands the sender.
-    `This message is from peer \`${from}\` — another agent instance, not your user.`,
-    `Reply with \`peer_send\` to="${from}" if a response is useful.`,
-  ].join('\n');
-}
-
-/** True when `from` already consumed its hourly wake budget (prunes first). */
-export function isWakeOverBudget(
-  wakes: Map<string, number[]>,
-  from: string,
-  now: number,
-  max: number = MAX_WAKES_PER_PEER_PER_HOUR
-): boolean {
-  const stamps = wakes.get(from) ?? [];
-  const fresh = stamps.filter((t) => now - t < WAKE_WINDOW_MS);
-  if (fresh.length === 0) wakes.delete(from);
-  else if (fresh.length !== stamps.length) wakes.set(from, fresh);
-  return fresh.length >= max;
-}
-
-/** Record one real wake for `from` (prunes expired stamps). */
-export function recordPeerWake(wakes: Map<string, number[]>, from: string, now: number): void {
-  const stamps = wakes.get(from) ?? [];
-  stamps.push(now);
-  wakes.set(
-    from,
-    stamps.filter((t) => now - t < WAKE_WINDOW_MS)
-  );
-}
-
-// `followUp` queues without starting a turn in either host state — that is
-// the wake budget's intent; `aside` would still wake an idle session.
-// Returns the failure message when the host rejects the call.
-async function aside(
-  pi: ExtensionHostLike,
-  ctx: CommandContextLike,
-  text: string
-): Promise<string | undefined> {
-  try {
-    await pi.sendUserMessage?.(text, { deliverAs: 'followUp' });
-    return undefined;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    warn(ctx, `peers: aside delivery failed (${message})`);
-    return message;
+  /**
+   * True when `key` has no wake budget left. An unseen key is over budget
+   * once MAX_WAKE_IDENTITIES fresh identities fill the table, until entries
+   * age past WAKE_WINDOW_MS and prune away.
+   */
+  overBudget(key: PeerIdentity, now: number = Date.now()): boolean {
+    this.prune(now);
+    const stamps = this.wakes.get(identityKey(key));
+    if (stamps === undefined) return this.wakes.size >= MAX_WAKE_IDENTITIES;
+    return stamps.length >= WAKES_PER_HOUR;
   }
+
+  /** Records one real wake for `key`; false when over WAKES_PER_HOUR or the identity table is full. */
+  noteWake(key: PeerIdentity, now: number = Date.now()): boolean {
+    if (this.overBudget(key, now)) return false;
+    const entry = identityKey(key);
+    const stamps = this.wakes.get(entry) ?? [];
+    stamps.push(now);
+    this.wakes.set(entry, stamps);
+    return true;
+  }
+
+  private prune(now: number): void {
+    for (const [entry, stamps] of this.wakes) {
+      const fresh = stamps.filter((stamp) => now - stamp < WAKE_WINDOW_MS);
+      if (fresh.length === 0) this.wakes.delete(entry);
+      else if (fresh.length !== stamps.length) this.wakes.set(entry, fresh);
+    }
+  }
+}
+
+const PROCESS_WAKE_RING: number[] = [];
+
+/**
+ * The one process-global wake gate: a fixed ring of at most
+ * PROCESS_WAKES_PER_HOUR timestamps per rolling hour, shared by every
+ * binding. Holds timestamps only.
+ */
+export function processWakeAllowed(now: number = Date.now()): boolean {
+  for (;;) {
+    const oldest = PROCESS_WAKE_RING[0];
+    if (oldest === undefined || now - oldest < WAKE_WINDOW_MS) break;
+    PROCESS_WAKE_RING.shift();
+  }
+  if (PROCESS_WAKE_RING.length >= PROCESS_WAKES_PER_HOUR) return false;
+  PROCESS_WAKE_RING.push(now);
+  return true;
+}
+
+/** `[peer <name>]: <body> [id <id>]` so the agent can quote the exact message id when replying. */
+export function formatPeerText(from: string, body: string, opts: { id: string }): string {
+  // The body crosses an envelope-line boundary: runs of C0/C1 controls (CR/LF
+  // included) collapse to one space, then marker lookalikes are rewritten, so
+  // the trailing id marker is the only bracket marker in the output. Backticks
+  // and ordinary text pass through untouched.
+  let safe = '';
+  let controlRun = false;
+  for (const char of body) {
+    const code = char.codePointAt(0) ?? 0;
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) {
+      controlRun = true;
+      continue;
+    }
+    if (controlRun) {
+      safe += ' ';
+      controlRun = false;
+    }
+    safe += char;
+  }
+  if (controlRun) safe += ' ';
+  const marked = safe.replaceAll('[id ', '(id ').replaceAll('[peer ', '(peer ');
+  return `[peer ${from}]: ${marked} [id ${opts.id}]`;
+}
+
+/** Control characters collapsed to spaces, trimmed, UTF-8 clamped to `max` bytes. */
+function clampText(value: string, max: number): string {
+  let cleaned = '';
+  for (const char of value) {
+    const code = char.codePointAt(0) ?? 0;
+    cleaned += code <= 0x1f || (code >= 0x7f && code <= 0x9f) ? ' ' : char;
+  }
+  cleaned = cleaned.trim();
+  const bytes = Buffer.from(cleaned, 'utf8');
+  if (bytes.length <= max) return cleaned;
+  let end = max;
+  while (end > 0) {
+    const byte = bytes[end];
+    if (byte === undefined || (byte & 0xc0) !== 0x80) break;
+    end -= 1;
+  }
+  return bytes.subarray(0, end).toString('utf8');
+}
+
+function failureText(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  return clampText(raw, 200);
+}
+
+function clampTodo(todo: PeerTodo): PeerTodo {
+  const out: PeerTodo = { ...todo };
+  if (typeof out.phase === 'string') out.phase = clampText(out.phase, MAX_STATUS_TEXT_BYTES);
+  if (typeof out.text === 'string') out.text = clampText(out.text, MAX_STATUS_TEXT_BYTES);
+  if (typeof out.blocker === 'string') out.blocker = clampText(out.blocker, MAX_STATUS_TEXT_BYTES);
+  return out;
 }
 
 function warn(ctx: CommandContextLike, text: string): void {
@@ -125,63 +144,203 @@ function warn(ctx: CommandContextLike, text: string): void {
   }
 }
 
-/**
- * Deliver one coalesced inbound message. Never throws; the outcome tells the
- * socket layer what receipt to send back.
- */
-export async function deliverInboundPeerMessage(
-  frame: InboundCarrier,
-  deps: InboundDeps
-): Promise<{ outcome: InboundOutcome; detail?: string }> {
-  const now = deps.now?.() ?? Date.now();
-  const cur = deps.getCurrent();
-  if (cur === undefined) return { outcome: 'dropped', detail: 'no live session context' };
-  const from = frame.from ?? '';
-  const body = frame.body ?? '';
-  if (from === '' || body === '') return { outcome: 'dropped', detail: 'empty frame' };
-
-  const wakes = deps.wakes ?? new Map<string, number[]>();
-  const text = formatPeerText(from, body, { replyTo: frame.replyTo });
-
-  let willWake = true;
-  try {
-    willWake = cur.ctx.isIdle?.() !== false;
-  } catch {
-    willWake = true;
-  }
-  if (typeof cur.pi.sendUserMessage !== 'function') {
-    warn(cur.ctx, `peers: dropped a message from ${from} — the host has no sendUserMessage`);
-    return { outcome: 'dropped', detail: 'no sendUserMessage on host' };
+export function createHostDelivery(opts: {
+  getHost: () => { pi: ExtensionHostLike; ctx: CommandContextLike } | undefined;
+  pending: PendingStore;
+  wakes: WakeLimiter;
+  heldCount: () => number;
+  acceptance: () => AcceptanceState;
+  /** Whether the binding is armed: record published and live. */
+  armed: () => boolean;
+  /** Shared not-armed diagnostic; identical to the binding's gate text. */
+  notArmedDetail: () => string;
+  onSubmitted: (envelopes: AuthenticatedEnvelope[]) => void;
+  captureEpoch: () => EpochSnapshot;
+  isEpochValid: (captured: EpochSnapshot) => boolean;
+  getActivity?: () => string | undefined;
+}): HostDelivery {
+  function acceptanceState(): AcceptanceState {
+    try {
+      return opts.acceptance();
+    } catch {
+      return 'shutting_down';
+    }
   }
 
-  if (willWake && isWakeOverBudget(wakes, from, now)) {
-    const failure = await aside(cur.pi, cur.ctx, text);
-    if (failure !== undefined) return { outcome: 'dropped', detail: failure };
-    return { outcome: 'aside', detail: 'hourly wake budget exceeded' };
+  function epochValid(captured: EpochSnapshot): boolean {
+    try {
+      return opts.isEpochValid(captured);
+    } catch {
+      return false;
+    }
   }
 
-  // Typing protection: injecting while idle runs the host prompt flow, which
-  // clears the peer's in-progress composer draft. While streaming the message
-  // rides the steer path, which leaves the draft alone — so hold only when
-  // delivery would wake. Bounded: an overstayed hold delivers anyway.
-  let draft = '';
-  try {
-    const read = deps.getDraftText?.() ?? '';
-    draft = typeof read === 'string' ? read : '';
-  } catch {
-    draft = '';
+  function currentHost(): { pi: ExtensionHostLike; ctx: CommandContextLike } | undefined {
+    try {
+      return opts.getHost();
+    } catch {
+      return undefined;
+    }
   }
-  const heldFor = deps.receivedAt === undefined ? 0 : Math.max(0, now - deps.receivedAt);
-  if (draft !== '' && willWake && heldFor < HOLD_TIMEOUT_MS) {
-    return { outcome: 'held', detail: 'peer is typing' };
+
+  // Identity ring first, then the process-global ring; both must pass to
+  // count and record the wake. Limiter failures degrade to allowed so a
+  // broken budget never blocks delivery.
+  function wakeAllowed(from: PeerIdentity): boolean {
+    try {
+      if (opts.wakes.overBudget(from)) return false;
+      if (!processWakeAllowed()) return false;
+      opts.wakes.noteWake(from);
+      return true;
+    } catch {
+      return true;
+    }
   }
-  try {
-    await cur.pi.sendUserMessage(text);
-    if (willWake) recordPeerWake(wakes, from, now);
-    return { outcome: willWake ? 'woken' : 'injected' };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    warn(cur.ctx, `peers: message from ${from} could not be delivered (${message})`);
-    return { outcome: 'dropped', detail: message };
-  }
+
+  return {
+    captureEpoch: () => opts.captureEpoch(),
+    isEpochValid: (captured) => epochValid(captured),
+
+    // One admission decision for every server-visible operation (msg, status,
+    // ping, held-reserve): undefined to proceed. Before record publication
+    // every operation is refused with host_unavailable plus the shared
+    // diagnostic; host_unavailable never enters AcceptanceState.
+    admissionCode: () => {
+      const state = acceptanceState();
+      if (state !== 'accepting') return { code: state };
+      let ready = false;
+      try {
+        ready = opts.armed();
+      } catch {
+        // A broken armed probe fails closed.
+      }
+      if (ready) return undefined;
+      let detail = 'peers: not armed';
+      try {
+        detail = opts.notArmedDetail();
+      } catch {
+        // A broken diagnostic falls back to the shared default text.
+      }
+      return { code: 'host_unavailable', detail };
+    },
+
+    submitBatch: async (envelopes) => {
+      const first: AuthenticatedEnvelope | undefined = envelopes[0];
+      if (first === undefined) return { code: 'invalid_request', detail: 'empty batch' };
+      // Recheck closed, transitionPending and every accept-time epoch
+      // immediately before the host call; a stale batch injects nothing.
+      const state = acceptanceState();
+      if (state !== 'accepting') return { code: state };
+      for (const envelope of envelopes) {
+        const captured: EpochSnapshot | undefined = envelope.epoch;
+        if (captured === undefined || !epochValid(captured)) return { code: 'session_transition' };
+      }
+      const host = currentHost();
+      if (host === undefined) return { code: 'host_unavailable', detail: 'no live session context' };
+      if (typeof host.pi.sendUserMessage !== 'function') {
+        return { code: 'host_unavailable', detail: 'host has no sendUserMessage' };
+      }
+      const allowed = wakeAllowed(first.from);
+      const text = envelopes.map((envelope) => envelope.body).join('\n');
+      let returned: Promise<void> | undefined;
+      try {
+        returned = host.pi.sendUserMessage(
+          text,
+          allowed ? { attribution: 'agent' } : { attribution: 'agent', deliverAs: 'followUp' }
+        ) as Promise<void> | undefined;
+      } catch (err) {
+        const detail = failureText(err);
+        return detail === '' ? { code: 'host_unavailable' } : { code: 'host_unavailable', detail };
+      }
+      // `submitted` means the plugin synchronously invoked the host call; an
+      // async host failure is warned about and never re-coded.
+      if (returned !== undefined && typeof returned.catch === 'function') {
+        void returned.catch((err: unknown) => {
+          warn(host.ctx, `peers: async host submission failed (${failureText(err)})`);
+        });
+      }
+      try {
+        opts.onSubmitted(envelopes);
+      } catch (err) {
+        warn(host.ctx, `peers: onSubmitted hook failed (${failureText(err)})`);
+      }
+      return { code: allowed ? 'submitted' : 'followup_submitted' };
+    },
+
+    canSubmitNow: () => {
+      // The host can accept a submission right now: no live session, draft
+      // text in the composer, or a non-accepting binding all say no. Held
+      // capacity and the FIFO-behind-held rule belong to the server.
+      if (acceptanceState() !== 'accepting') return false;
+      const host = currentHost();
+      if (host === undefined) return false;
+      try {
+        const draft = host.ctx.ui.getEditorText?.();
+        if (typeof draft === 'string' && draft !== '') return false;
+      } catch {
+        // An unreadable composer is treated as clear rather than blocking forever.
+      }
+      return true;
+    },
+
+    reserveHeld: () => {
+      try {
+        return opts.heldCount() < MAX_HELD_BATCHES;
+      } catch {
+        return false;
+      }
+    },
+
+    // The caller owns the held count behind heldCount(); releasing simply
+    // re-opens reserveHeld's MAX_HELD_BATCHES budget on the caller's
+    // decrement, so there is nothing to mutate here.
+    releaseHeld: () => {},
+
+    statusSnapshot: (fields) => {
+      const requested = Array.isArray(fields)
+        ? fields.filter((field) => typeof field === 'string')
+        : undefined;
+      const host = currentHost();
+      if (host === undefined) return { busy: false };
+      const wants = (field: string): boolean => requested === undefined || requested.includes(field);
+      const ctx = host.ctx;
+      const snapshot: StatusSnapshot = { busy: readBusy(ctx) };
+      if (wants('model')) {
+        const model = clampText(readModel(ctx), MAX_STATUS_ACTIVITY_BYTES);
+        if (model !== '') snapshot.model = model;
+      }
+      if (wants('activity')) {
+        let activity: string | undefined;
+        try {
+          activity = opts.getActivity?.();
+        } catch {
+          activity = undefined;
+        }
+        if (typeof activity === 'string') {
+          const bounded = clampText(activity, MAX_STATUS_ACTIVITY_BYTES);
+          if (bounded !== '') snapshot.activity = bounded;
+        }
+      }
+      if (wants('todos')) {
+        let todos: PeerTodo[] = [];
+        try {
+          todos = readNativeTodos(ctx.sessionManager);
+        } catch {
+          todos = [];
+        }
+        snapshot.todos = todos.slice(0, MAX_STATUS_TODOS).map(clampTodo);
+      }
+      return snapshot;
+    },
+
+    consumeReply: (from, replyTo, body) => {
+      try {
+        return opts.pending.settle(from, replyTo, body);
+      } catch {
+        return false;
+      }
+    },
+
+    acceptance: acceptanceState,
+  };
 }

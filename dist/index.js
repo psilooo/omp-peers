@@ -1,29 +1,31 @@
 /**
- * peers — opt-in live peer awareness for OMP/pi agent instances.
- *
- * Install is opt-in; every running instance is auto-present via its
- * `<state>/peers/<pid>.json` heartbeat. Library entry (storage + presence +
- * transport + delivery); the extension entry is `./extension.js`.
+ * peers library barrel: the public protocol v2 surface of the extension.
+ * No v1 names and no bridge names.
  */
+export * from './peers/protocol.js';
+export { CorruptStateError, PeerNameError } from './errors.js';
 // Store layer.
-export { resolveStateDir, ensureStateDirs, peersDir, peerPath, } from './store/paths.js';
-export { durableWriteJson, readJsonFile, } from './store/atomic.js';
+export { durableWriteJson, readJsonBounded } from './store/atomic.js';
+export { ensureStateRoots, peerEndpoint, peerRecordPath, rootHash, validateUnixEndpoint } from './store/paths.js';
 // Peer identity.
-export { PEER_NAME_PATTERN, isValidPeerName, validatePeerName, defaultPeerName, peerNameFromSession, resolvePeerName, } from './peers/ids.js';
+export { hasDuplicateRoutableNames, newIdentity, projectFor, resolveName } from './peers/ids.js';
 // Presence.
-export { writePeerBeat, listLivePeers, removePeerRecord, startPresenceBeat, formatBeatAge, HEARTBEAT_MS, PEER_TTL_MS, } from './peers/presence.js';
-// Transport.
-export { MAX_HOPS, COALESCE_MS, PEER_REQUEST_TIMEOUT_MS, SOCKET_IDLE_MS, MAX_FRAME_BYTES, peerSocketAddress, startPeerServer, requestPeer, } from './peers/server.js';
-// Delivery.
-export { deliverInboundPeerMessage, formatPeerText, isWakeOverBudget, recordPeerWake, MAX_WAKES_PER_PEER_PER_HOUR, WAKE_WINDOW_MS, HOLD_TIMEOUT_MS, MAX_HELD_BATCHES, HOLD_POLL_MS, } from './peers/inbound.js';
-export { sendToPeer, outboundHop } from './peers/outbound.js';
-// Roster.
-export { buildPeersNote, appendNoteToMessages, } from './peers/roster.js';
+export { formatBeatAge, readPeerRecord, removeOwnRecord, scanPeers, writeOwnRecord } from './peers/presence.js';
 // Host seam.
-export { probeHost, listLocalAgentIds, claimBridgedPeer, readTitleSource, readNativeTodos, MAX_PEER_TODOS, MAX_PEER_TODO_TEXT_CHARS, releaseBridgedPeer, peerActivityFor, } from './peers/host.js';
-// Commands (pure text formatters for tests/consumers).
-export { formatPeersText, formatPeerLine } from './commands/peers.js';
-// Agent tool surface (registered unconditionally in every mode).
-export { registerPeerSendTool, registerPeerStatusTool, registerPeerRequestTool, } from './tools.js';
-// Errors and shared schemas.
-export * from './errors.js';
+export { MAX_PEER_TODOS, MAX_PEER_TODO_TEXT_CHARS, managedTimers, readBusy, readModel, readNativeTodos, readSessionName, readTitleSource, } from './peers/host.js';
+// Roster.
+export { buildPeersNote, sanitizeDisplay, withRosterNote } from './peers/roster.js';
+// Session classification.
+export { classifySession } from './peers/session-kind.js';
+// Transport.
+export { startPeerServer } from './peers/server.js';
+// Outbound delivery.
+export { PendingStore, pingPeer, requestMsg, resolveTarget, sendMsg, statusOf } from './peers/outbound.js';
+// Inbound delivery.
+export { WakeLimiter, createHostDelivery, formatPeerText, processWakeAllowed } from './peers/inbound.js';
+// Agent tool surface.
+export { registerPeerTools, renderReceipt } from './tools.js';
+// Command surface.
+export { formatPeerLine, formatPeersText, registerPeersCommand } from './commands/peers.js';
+// Binding.
+export { createPeerBinding } from './peers/binding.js';

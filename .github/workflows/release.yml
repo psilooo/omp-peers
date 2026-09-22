@@ -1,0 +1,295 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Annotated release tag, for example v2.0.0
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    outputs:
+      version: ${{ steps.pack.outputs.version }}
+    steps:
+      - name: Resolve and peel the annotated input tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            v*) ;;
+            *) echo "tag input must start with v: $TAG"; exit 1 ;;
+          esac
+          TYPE=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.type')
+          if [ "$TYPE" != "tag" ]; then
+            echo "input $TAG is not an annotated tag"
+            exit 1
+          fi
+          OBJECT=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha')
+          PEEL_TYPE=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$OBJECT" --jq '.object.type')
+          PEEL_SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$OBJECT" --jq '.object.sha')
+          if [ "$PEEL_TYPE" != "commit" ]; then
+            echo "annotated tag $TAG does not peel to a commit"
+            exit 1
+          fi
+          echo "object=$OBJECT" >> "$GITHUB_OUTPUT"
+          echo "commit=$PEEL_SHA" >> "$GITHUB_OUTPUT"
+      - name: Checkout the peeled commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.tag.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert HEAD is the peeled commit
+        env:
+          EXPECTED_COMMIT: ${{ steps.tag.outputs.commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Tag equals v plus the package version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          test "$TAG" = "v$VERSION"
+      - name: Peeled commit is contained in protected main
+        env:
+          EXPECTED_COMMIT: ${{ steps.tag.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$EXPECTED_COMMIT" origin/main
+      - name: Marketplace versions, source ref, and changelog match
+        run: |
+          set -euo pipefail
+          npm run check:release
+      - name: Required CI succeeded on the peeled commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_COMMIT: ${{ steps.tag.outputs.commit }}
+        run: |
+          set -euo pipefail
+          DISPATCH_AT=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq '.created_at')
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$EXPECTED_COMMIT&status=completed&per_page=100" \
+            > "$RUNNER_TEMP/ci-runs.json"
+          RUN_ID=$(jq -r --arg t "$DISPATCH_AT" \
+            '[.workflow_runs[] | select(.completed_at != null and .completed_at < $t)] | sort_by(.run_number) | (last // {}) | .id // empty' \
+            "$RUNNER_TEMP/ci-runs.json")
+          if [ -z "$RUN_ID" ]; then
+            echo "no completed CI run on $EXPECTED_COMMIT finished before this dispatch"
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" > "$RUNNER_TEMP/ci-jobs.json"
+          for JOB in verify bun-floor pinned-host-floor; do
+            MATCHES=$(jq --arg p "$JOB" '[.jobs[] | select(.name == $p or (.name | startswith($p + " ")))]' "$RUNNER_TEMP/ci-jobs.json")
+            COUNT=$(jq 'length' <<< "$MATCHES")
+            if [ "$COUNT" -eq 0 ]; then
+              echo "no check runs found for required job $JOB"
+              exit 1
+            fi
+            NOT_GREEN=$(jq '[.[] | select(.conclusion != "success")] | length' <<< "$MATCHES")
+            if [ "$NOT_GREEN" -ne 0 ]; then
+              echo "check runs for required job $JOB are not all successful"
+              jq -r '.[] | "\(.name) \(.conclusion)"' <<< "$MATCHES"
+              exit 1
+            fi
+          done
+      - name: No release exists for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          LOOKUP="$RUNNER_TEMP/release-existence.txt"
+          set +e
+          gh api -i "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > "$LOOKUP" 2> "$LOOKUP.err"
+          RC=$?
+          set -e
+          STATUS=$(awk 'toupper($1) ~ /^HTTP\// { code = $2 } END { print code }' "$LOOKUP")
+          if [ "$STATUS" = "200" ]; then
+            echo "a release already exists for $TAG"
+            exit 1
+          fi
+          if [ "$STATUS" = "404" ]; then
+            exit 0
+          fi
+          echo "release existence lookup for $TAG failed: HTTP status ${STATUS:-unavailable} (gh exit code $RC)"
+          cat "$LOOKUP.err" >&2 || true
+          exit 1
+      - name: Rerun the deterministic Linux gates
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run typecheck
+          npm run build:clean
+          npm run check:dist
+          npm test
+      - name: Remote marketplace and tag smokes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          EXPECTED_COMMIT: ${{ steps.tag.outputs.commit }}
+          EXPECTED_TAG_OBJECT: ${{ steps.tag.outputs.object }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          REMOTE_OBJECT=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha')
+          test "$REMOTE_OBJECT" = "$EXPECTED_TAG_OBJECT"
+          test "$(git rev-parse "$TAG^{commit}")" = "$EXPECTED_COMMIT"
+          gh api "repos/$GITHUB_REPOSITORY/contents/.omp-plugin/marketplace.json?ref=$TAG" --jq .content \
+            | base64 -d > "$RUNNER_TEMP/remote-marketplace.json"
+          jq -e --arg v "$VERSION" \
+            '.metadata.version == $v
+             and .plugins[0].version == $v
+             and .plugins[0].source.source == "github"
+             and .plugins[0].source.repo == "psilooo/omp-peers"
+             and .plugins[0].source.ref == ("v" + $v)' \
+            "$RUNNER_TEMP/remote-marketplace.json"
+      - name: Install the OMP floor CLI for the remote smokes
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/omp-smoke-cli" --no-save @oh-my-pi/pi-coding-agent@18.2.6
+          "$RUNNER_TEMP/omp-smoke-cli/node_modules/.bin/omp" --version
+      - name: Remote marketplace install resolves the pushed tag and loads 2.0.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PI_CODING_AGENT_DIR: ${{ runner.temp }}/omp-smoke-a-profile
+          OMP_PEERS_DIR: ${{ runner.temp }}/omp-smoke-a-state
+        run: |
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/omp-smoke-cli/node_modules/.bin/omp"
+          mkdir -p "$PI_CODING_AGENT_DIR"
+          "$BIN" plugin marketplace add "$GITHUB_REPOSITORY"
+          "$BIN" plugin install omp-peers@omp-peers
+          LIST=$("$BIN" plugin list --json)
+          echo "$LIST" | jq -e '
+            any(.npm[]?; .name == "omp-peers" and .version == "2.0.0")
+            or any(.marketplace[]?; .id == "omp-peers@omp-peers"
+                   and any(.entries[]?; .version == "2.0.0"))'
+          EXT=$(echo "$LIST" | jq -r '
+            [ .npm[]? | select(.name == "omp-peers")
+              | .path + "/" + (.manifest.extensions[0] // "dist/extension.js") ]
+            + [ .marketplace[]? | select(.id == "omp-peers@omp-peers")
+                | .entries[]? | .installPath + "/dist/extension.js" ]
+            | .[0] // empty')
+          test -n "$EXT"
+          test -f "$EXT"
+          cmp -s "$GITHUB_WORKSPACE/dist/extension.js" "$EXT"
+          node -e 'const v = require(process.argv[1]).version; if (v !== "2.0.0") { console.error("expected installed omp-peers 2.0.0, got " + v); process.exit(1); }' \
+            "${EXT%/dist/extension.js}/package.json"
+          "$BIN" models -e "$EXT"
+          if [ -e "$OMP_PEERS_DIR" ] && [ -n "$(ls -A "$OMP_PEERS_DIR")" ]; then
+            echo "peer state was created outside an arming top-level session"
+            exit 1
+          fi
+      - name: Upstream v1.4.0 marketplace migrates to the fork at 2.0.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PI_CODING_AGENT_DIR: ${{ runner.temp }}/omp-smoke-b-profile
+          OMP_PEERS_DIR: ${{ runner.temp }}/omp-smoke-b-state
+        run: |
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/omp-smoke-cli/node_modules/.bin/omp"
+          test -x "$BIN"
+          mkdir -p "$PI_CODING_AGENT_DIR"
+          "$BIN" plugin marketplace add nikkoxgonzales/omp-peers
+          "$BIN" plugin install omp-peers@omp-peers
+          UP_LIST=$("$BIN" plugin list --json)
+          echo "$UP_LIST" | jq -e '
+            any(.npm[]?; .name == "omp-peers" and .version == "1.4.0")
+            or any(.marketplace[]?; .id == "omp-peers@omp-peers"
+                   and any(.entries[]?; .version == "1.4.0"))'
+          "$BIN" plugin marketplace remove omp-peers
+          "$BIN" plugin marketplace add "$GITHUB_REPOSITORY"
+          "$BIN" plugin upgrade omp-peers@omp-peers
+          LIST=$("$BIN" plugin list --json)
+          echo "$LIST" | jq -e '
+            any(.npm[]?; .name == "omp-peers" and .version == "2.0.0")
+            or any(.marketplace[]?; .id == "omp-peers@omp-peers"
+                   and any(.entries[]?; .version == "2.0.0"))'
+          EXT=$(echo "$LIST" | jq -r '
+            [ .npm[]? | select(.name == "omp-peers")
+              | .path + "/" + (.manifest.extensions[0] // "dist/extension.js") ]
+            + [ .marketplace[]? | select(.id == "omp-peers@omp-peers")
+                | .entries[]? | .installPath + "/dist/extension.js" ]
+            | .[0] // empty')
+          test -n "$EXT"
+          test -f "$EXT"
+          node -e 'const v = require(process.argv[1]).version; if (v !== "2.0.0") { console.error("expected migrated omp-peers 2.0.0, got " + v); process.exit(1); }' \
+            "${EXT%/dist/extension.js}/package.json"
+          "$BIN" models -e "$EXT"
+          if [ -e "$OMP_PEERS_DIR" ] && [ -n "$(ls -A "$OMP_PEERS_DIR")" ]; then
+            echo "peer state was created outside an arming top-level session"
+            exit 1
+          fi
+      - name: Build the release tarball once
+        id: pack
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          NAME="omp-peers-$VERSION.tgz"
+          node scripts/check-pack.mjs --output "$RUNNER_TEMP/$NAME"
+          (cd "$RUNNER_TEMP" && shasum -a 256 "$NAME" > "$NAME.sha256")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Upload the exact tarball with its SHA-256 manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ steps.pack.outputs.version }}
+          path: |
+            ${{ runner.temp }}/omp-peers-*.tgz
+            ${{ runner.temp }}/omp-peers-*.sha256
+          if-no-files-found: error
+
+  attest-and-draft:
+    needs: verify
+    runs-on: macos-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-${{ needs.verify.outputs.version }}
+          path: ${{ runner.temp }}/release-artifact
+      - name: Verify the downloaded SHA-256 digest
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/release-artifact"
+          shasum -a 256 -c ./*.sha256
+      - name: Attest the exact tarball
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/release-artifact/omp-peers-${{ needs.verify.outputs.version }}.tgz
+      - name: Attach the tarball to a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" "$RUNNER_TEMP/release-artifact/omp-peers-$VERSION.tgz" \
+            --draft \
+            --verify-tag \
+            --title "omp-peers $VERSION" \
+            --generate-notes

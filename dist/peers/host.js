@@ -1,101 +1,17 @@
 /**
- * Host seam: narrow structural types plus the capability probe.
- *
- * STRUCTURAL RULE (1): never import host singletons (`registry/agent-registry`,
- * `irc/bus`, `tools/hub/messaging`). The extension's module graph may bind a
- * FOREIGN copy of the host modules (two `static #global` instances), so the
- * host is touched ONLY through `ctx`/`pi` surfaces plus the bridge probed
- * below via literal-specifier dynamic imports inside try/catch (the host
- * loader rewrites literal specifiers to the host's own module instances).
- * Future #7401 seams slot in here.
+ * Host seam: narrow structural types plus guarded public helpers for title
+ * source, session name, native todos, busy/model reads, and managed timers.
+ * No host singletons; the host is touched only through `ctx`/`pi` surfaces.
  */
-/**
- * True when the probed registry is the HOST's own (shared) copy. The host
- * always keeps its driving agent registered, so a shared copy resolves
- * `Main`; a foreign module copy — which the compiled omp binary hands to
- * dynamic importers — has an empty map and nothing we claim there is
- * visible to the host's `hub`. Bridges that fail this probe must not claim
- * refs or promise `hub send` in the roster.
- */
-export function bridgeResolvesHost(bridge) {
-    try {
-        // 'Main' is the host driving agent's registry id — a presence probe,
-        // never a delivery address (see ids.ts REFUSED_HOST_NAME).
-        return bridge.registry.get('Main') !== undefined;
-    }
-    catch {
-        return false;
-    }
-}
-/**
- * Capability probe. Literal specifiers only (the host rewrites them), always
- * inside try/catch: on any host without these modules this resolves
- * `{kind:'tools'}` and the extension falls back to the `peer_send` surface.
- * The result caches host MODULE handles only — never any session object.
- */
-export async function probeHost() {
-    try {
-        const registryModule = (await import('@oh-my-pi/pi-coding-agent/registry/agent-registry'));
-        const agentRegistry = registryModule['AgentRegistry'];
-        if (typeof agentRegistry?.global !== 'function') {
-            return { kind: 'tools' };
-        }
-        return {
-            kind: 'hub-bridge',
-            bridge: { registry: agentRegistry.global() },
-        };
-    }
-    catch {
-        return { kind: 'tools' };
-    }
-}
-function registryRefs(registry) {
-    try {
-        if (typeof registry.values === 'function')
-            return [...registry.values()];
-        if (typeof registry.list === 'function') {
-            const out = registry.list();
-            return Array.isArray(out) ? out : [];
-        }
-        if (typeof registry.entries === 'function') {
-            return [...registry.entries()].map(([, v]) => v);
-        }
-    }
-    catch {
-        return [];
-    }
-    return [];
-}
-/**
- * `peerSocket` marker). Used to keep a session name from colliding with a
- * live subagent address during peer-name deconfliction.
- */
-export function listLocalAgentIds(registry) {
-    const ids = [];
-    for (const ref of registryRefs(registry)) {
-        if (typeof ref.id !== 'string' || ref.id === '')
-            continue;
-        const session = ref.session;
-        if (session !== null && typeof session === 'object' && session.peerSocket !== undefined) {
-            continue;
-        }
-        ids.push(ref.id);
-    }
-    return ids;
-}
 /**
  * Who named this session. The host marks explicit renames `"user"` and
- * model-generated titles `"auto"` on the session header (on-contract via
- * `ReadonlySessionManager.getHeader`) and on the manager itself (structural —
- * the runtime object is the full SessionManager). Returns undefined when the
- * host exposes neither; callers keep legacy adopt-or-warn behavior.
+ * model-generated titles `"auto"` on the session header and on the manager
+ * itself. Returns undefined when the host exposes neither; every read is
+ * guarded so unknown host shapes fall through instead of throwing.
  */
 export function readTitleSource(manager) {
     if (manager === undefined || manager === null)
         return undefined;
-    // Header first (on-contract), then the manager itself (structural) — first
-    // non-empty string wins. Every read is guarded: unknown host shapes fall
-    // through to undefined and callers keep legacy adopt-or-warn behavior.
     const candidates = [];
     try {
         candidates.push(manager.getHeader?.());
@@ -115,20 +31,86 @@ export function readTitleSource(manager) {
     }
     return undefined;
 }
+/** The session's display name: ctx manager first, then the host-level getter. */
+export function readSessionName(pi, ctx) {
+    try {
+        const fromCtx = ctx.sessionManager?.getSessionName?.();
+        if (typeof fromCtx === 'string' && fromCtx !== '')
+            return fromCtx;
+    }
+    catch {
+        // Manager read is best-effort.
+    }
+    try {
+        const fromHost = pi.getSessionName?.();
+        if (typeof fromHost === 'string' && fromHost !== '')
+            return fromHost;
+    }
+    catch {
+        // Host read is best-effort.
+    }
+    return undefined;
+}
+/** True while the host reports the session is not idle. */
+export function readBusy(ctx) {
+    try {
+        return ctx.isIdle() === false;
+    }
+    catch {
+        return false;
+    }
+}
+/** The ctx model id, or '' when the host exposes none. */
+export function readModel(ctx) {
+    const id = ctx.model?.id;
+    return typeof id === 'string' ? id : '';
+}
+/**
+ * The ctx-managed timer trio, or undefined unless all three are callable.
+ * All scheduling must route through these so shutdown can clear every timer.
+ */
+export function managedTimers(ctx) {
+    const interval = ctx.setInterval;
+    const timeout = ctx.setTimeout;
+    const clear = ctx.clearTimer;
+    if (typeof interval !== 'function' ||
+        typeof timeout !== 'function' ||
+        typeof clear !== 'function') {
+        return undefined;
+    }
+    return {
+        setInterval: (callback, ms) => ctx.setInterval?.(callback, ms),
+        setTimeout: (callback, ms) => ctx.setTimeout?.(callback, ms),
+        clearTimer: (timer) => ctx.clearTimer?.(timer),
+    };
+}
 /** Marker the host stamps on a user todo edit entry (`tools/todo.ts`). */
 const USER_TODO_EDIT_CUSTOM_TYPE = 'user_todo_edit';
 /** Cap on published todos: the heartbeat is a glance, not a transcript. */
 export const MAX_PEER_TODOS = 20;
-/** Cap on each published text field (phase, task, blocker). */
+/** Cap on each published text field (phase, task, blocker), in UTF-8 bytes. */
 export const MAX_PEER_TODO_TEXT_CHARS = 200;
 function asRecord(value) {
     return typeof value === 'object' && value !== null ? value : undefined;
 }
+/** Trim, then clamp to the UTF-8 byte ceiling without splitting a code point. */
 function clampTodoText(value) {
     const text = typeof value === 'string' ? value.trim() : '';
-    return text.length > MAX_PEER_TODO_TEXT_CHARS ? text.slice(0, MAX_PEER_TODO_TEXT_CHARS) : text;
+    if (text === '')
+        return '';
+    const bytes = new TextEncoder().encode(text);
+    if (bytes.length <= MAX_PEER_TODO_TEXT_CHARS)
+        return text;
+    let end = MAX_PEER_TODO_TEXT_CHARS;
+    while (end > 0) {
+        const byte = bytes[end];
+        if (byte === undefined || (byte & 0xc0) !== 0x80)
+            break;
+        end -= 1;
+    }
+    return new TextDecoder().decode(bytes.subarray(0, end));
 }
-/** Native `TodoStatus`, defaulting anything unrecognized (incl. legacy spellings) to pending. */
+/** Native todo status, defaulting anything unrecognized to pending. */
 function nativeTodoStatus(raw) {
     switch (raw) {
         case 'in_progress':
@@ -195,8 +177,7 @@ function mapNativeTodos(phases) {
         }
     }
     if (flat.length > MAX_PEER_TODOS) {
-        // Trim by usefulness — an in-progress task tells a peer more than a
-        // completed one — then restore the host's own order for display.
+        // Trim by usefulness, then restore the host's own order for display.
         const priority = (todo) => todo.status === 'in_progress' ? 0 : todo.status === 'pending' ? 1 : 2;
         flat.sort((a, b) => priority(a.todo) - priority(b.todo) || a.order - b.order);
         flat.length = MAX_PEER_TODOS;
@@ -207,7 +188,7 @@ function mapNativeTodos(phases) {
 /**
  * Read the host's NATIVE todo state out of the session transcript, newest
  * entry first: a `user_todo_edit` custom entry, else the latest successful
- * `todo` toolResult. Never throws — a host without the surface reads as [].
+ * `todo` toolResult. Never throws: a host without the surface reads as [].
  */
 export function readNativeTodos(manager) {
     let entries;
@@ -225,84 +206,4 @@ export function readNativeTodos(manager) {
             return mapNativeTodos(phases);
     }
     return [];
-}
-export function peerActivityFor(record) {
-    return `${record.harness} instance pid ${record.pid} in ${record.cwd}${record.busy ? ' (working)' : ''}`;
-}
-/**
- * Materialize a remote peer as a registry ref so native `hub send`/`hub list`
- * reach it. `kind:'sub'` + `status:'idle'` keeps the stub inside the host's
- * flat alive filter and clear of the parked lifecycle gate, so `hub send`
- * goes straight to the stub's `deliverIrcMessage` (socket round trip).
- * Refuses to overwrite a live local (non-peer) ref of the same id.
- */
-export function claimBridgedPeer(bridge, record, ownName, getHop, request, onWarn) {
-    let existing;
-    try {
-        existing = bridge.registry.get(record.name);
-    }
-    catch {
-        existing = undefined;
-    }
-    if (existing !== undefined && existing.session?.peerSocket === undefined) {
-        try {
-            onWarn?.(`peers: name "${record.name}" collides with a local agent; skipping bridge`);
-        }
-        catch {
-            // Warning delivery is best-effort.
-        }
-        return false;
-    }
-    const stub = {
-        isStreaming: false,
-        peerSocket: record.socket,
-        subscribe: () => () => undefined,
-        subscribeRunState: () => () => undefined,
-        waitForIrcReplies: async () => [],
-        deliverIrcMessage: async (msg) => {
-            const reply = await request(record.socket, {
-                t: 'msg',
-                from: ownName,
-                body: msg.body,
-                ...(msg.replyTo !== undefined && msg.replyTo !== '' ? { replyTo: msg.replyTo } : {}),
-                hop: getHop(),
-            });
-            // A dead socket or refused frame is a FAILURE, not a delivery: throwing
-            // makes the host bus report outcome 'failed' with this error text
-            // instead of the old blanket 'injected' that lied to hub senders.
-            if (reply === undefined || !reply.ok) {
-                throw new Error(reply?.error ?? 'peer socket unreachable');
-            }
-            // Pass the real outcome through ('woken'/'injected'/'held'/'aside'/
-            // 'dropped') — the receipt must show what the peer actually did.
-            return reply.outcome ?? 'injected';
-        },
-    };
-    try {
-        bridge.registry.register({
-            id: record.name,
-            displayName: `${record.name} · ${record.project}`,
-            kind: 'sub',
-            status: 'idle',
-            session: stub,
-            sessionFile: null,
-            activity: peerActivityFor(record),
-        });
-    }
-    catch {
-        return false;
-    }
-    return true;
-}
-/** Release a bridged peer ref, but only one this extension owns (marker). */
-export function releaseBridgedPeer(bridge, name) {
-    try {
-        const ref = bridge.registry.get(name);
-        if (ref?.session?.peerSocket === undefined)
-            return;
-        bridge.registry.unregister(name);
-    }
-    catch {
-        // Release is best-effort.
-    }
 }

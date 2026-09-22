@@ -1,8 +1,9 @@
 {
   "name": "omp-peers",
-  "version": "1.4.0",
-  "description": "Claude-Code-style cross-session peer awareness for Oh My Pi (omp) and pi: every running instance sees every other, live, on the same machine — /peers to list, /rename to name, peer_send to talk.",
+  "version": "2.0.0",
+  "description": "Cross-session peer awareness for omp: every running top-level instance sees every other, live, on the same machine. /peers to list, /rename to name, peer_send to talk.",
   "type": "module",
+  "private": true,
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -12,43 +13,56 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "CHANGELOG.md",
+    "SECURITY.md"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=22",
+    "bun": ">=1.3.14"
+  },
+  "ompCompat": {
+    "min": "18.2.6",
+    "maxExclusive": "19.0.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test test/peers.mjs",
-    "smoke": "npm run build && node test/peers.mjs"
+    "build:clean": "node scripts/clean-dist.mjs && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check:dist": "node scripts/check-dist.mjs",
+    "test": "node --test test/peers.mjs test/lifecycle.mjs",
+    "test:bun": "bun test ./test/peers.mjs ./test/lifecycle.mjs",
+    "check:release": "node scripts/check-release.mjs",
+    "check:pack": "node scripts/check-pack.mjs",
+    "smoke:host": "node scripts/smoke-host.mjs"
   },
   "omp": {
     "extensions": [
       "./dist/extension.js"
     ]
   },
-  "pi": {
-    "extensions": [
-      "./dist/extension.js"
-    ]
-  },
   "keywords": [
-    "oh-my-pi",
-    "pi-coding-agent",
+    "omp",
     "agents",
     "peers",
     "cross-session",
     "messaging",
-    "multi-agent"
+    "multi-agent",
+    "peer-discovery"
   ],
   "author": "Nikko Gonzales <nikkoxgonzales@gmail.com>",
+  "homepage": "https://github.com/psilooo/omp-peers",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nikkoxgonzales/omp-peers.git"
+    "url": "git+https://github.com/psilooo/omp-peers.git"
+  },
+  "bugs": {
+    "url": "https://github.com/psilooo/omp-peers/issues"
   },
   "license": "MIT",
+  "dependencies": {},
   "devDependencies": {
-    "@types/node": "^26.5.0",
-    "typescript": "^7.0.2"
+    "@types/node": "22.20.4",
+    "typescript": "7.0.2"
   }
 }

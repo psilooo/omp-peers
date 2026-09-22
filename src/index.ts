@@ -1,131 +1,73 @@
 /**
- * peers — opt-in live peer awareness for OMP/pi agent instances.
- *
- * Install is opt-in; every running instance is auto-present via its
- * `<state>/peers/<pid>.json` heartbeat. Library entry (storage + presence +
- * transport + delivery); the extension entry is `./extension.js`.
+ * peers library barrel: the public protocol v2 surface of the extension.
+ * No v1 names and no bridge names.
  */
 
+export * from './peers/protocol.js';
+export type { PeerTodo, PeerTodoStatus, PendingRequest } from './types.js';
+export { CorruptStateError, PeerNameError } from './errors.js';
+
 // Store layer.
-export {
-  resolveStateDir,
-  ensureStateDirs,
-  peersDir,
-  peerPath,
-} from './store/paths.js';
-export {
-  durableWriteJson,
-  readJsonFile,
-} from './store/atomic.js';
+export { durableWriteJson, readJsonBounded } from './store/atomic.js';
+export { ensureStateRoots, peerEndpoint, peerRecordPath, rootHash, validateUnixEndpoint } from './store/paths.js';
+export type { StateRoots } from './store/paths.js';
 
 // Peer identity.
-export {
-  PEER_NAME_PATTERN,
-  isValidPeerName,
-  validatePeerName,
-  defaultPeerName,
-  peerNameFromSession,
-  resolvePeerName,
-  type ResolveNameInput,
-} from './peers/ids.js';
+export { hasDuplicateRoutableNames, newIdentity, projectFor, resolveName } from './peers/ids.js';
+export type { ResolveNameInput } from './peers/ids.js';
 
 // Presence.
-export {
-  writePeerBeat,
-  listLivePeers,
-  removePeerRecord,
-  startPresenceBeat,
-  formatBeatAge,
-  HEARTBEAT_MS,
-  PEER_TTL_MS,
-  type BeatInput,
-  type ListPeersOptions,
-  type PresenceBeatOptions,
-} from './peers/presence.js';
-
-// Transport.
-export {
-  MAX_HOPS,
-  COALESCE_MS,
-  PEER_REQUEST_TIMEOUT_MS,
-  SOCKET_IDLE_MS,
-  MAX_FRAME_BYTES,
-  peerSocketAddress,
-  startPeerServer,
-  requestPeer,
-  type InboundMessage,
-  type PeerServerOptions,
-  type PeerServerHandle,
-} from './peers/server.js';
-
-// Delivery.
-export {
-  deliverInboundPeerMessage,
-  formatPeerText,
-  isWakeOverBudget,
-  recordPeerWake,
-  MAX_WAKES_PER_PEER_PER_HOUR,
-  WAKE_WINDOW_MS,
-  HOLD_TIMEOUT_MS,
-  MAX_HELD_BATCHES,
-  HOLD_POLL_MS,
-  type InboundCarrier,
-  type CurrentHost,
-  type InboundOutcome,
-  type InboundDeps,
-  type HeldBatch,
-} from './peers/inbound.js';
-export { sendToPeer, outboundHop, type HopState, type OutboundDeps } from './peers/outbound.js';
-
-// Roster.
-export {
-  buildPeersNote,
-  appendNoteToMessages,
-  type RosterMode,
-  type RosterMessage,
-} from './peers/roster.js';
+export { formatBeatAge, readPeerRecord, removeOwnRecord, scanPeers, writeOwnRecord } from './peers/presence.js';
+export type { PeerScan } from './peers/presence.js';
 
 // Host seam.
 export {
-  probeHost,
-  listLocalAgentIds,
-  claimBridgedPeer,
-  readTitleSource,
-  readNativeTodos,
   MAX_PEER_TODOS,
   MAX_PEER_TODO_TEXT_CHARS,
-  releaseBridgedPeer,
-  peerActivityFor,
-  type HostProbe,
-  type HubBridge,
-  type RegistryLike,
-  type RegistryRefLike,
-  type PeerRequestFn,
-  type CommandContextLike,
-  type ExtensionHostLike,
-  type UiLike,
-  type SelectOption,
+  managedTimers,
+  readBusy,
+  readModel,
+  readNativeTodos,
+  readSessionName,
+  readTitleSource,
+} from './peers/host.js';
+export type {
+  CommandContextLike,
+  ExtensionHostLike,
+  SelectOption,
+  SendOptions,
+  SessionManagerLike,
+  ToolInvokeResult,
+  UiLike,
 } from './peers/host.js';
 
-// Commands (pure text formatters for tests/consumers).
-export { formatPeersText, formatPeerLine, type PeersSnapshot } from './commands/peers.js';
-// Agent tool surface (registered unconditionally in every mode).
-export {
-  registerPeerSendTool,
-  registerPeerStatusTool,
-  registerPeerRequestTool,
-  type PeerSendDeps,
-  type PeerStatusDeps,
-  type PeerRequestDeps,
-} from './tools.js';
+// Roster.
+export { buildPeersNote, sanitizeDisplay, withRosterNote } from './peers/roster.js';
+export type { RosterMessage, RosterRow } from './peers/roster.js';
 
-// Errors and shared schemas.
-export * from './errors.js';
-export type {
-  HarnessKind,
-  PeerRecord,
-  PeerTodo,
-  PendingReply,
-  PeerFrame,
-  PeerReply,
-} from './types.js';
+// Session classification.
+export { classifySession } from './peers/session-kind.js';
+export type { SessionKind } from './peers/session-kind.js';
+
+// Transport.
+export { startPeerServer } from './peers/server.js';
+export type { AuthenticatedEnvelope, HostDelivery, ManagedTimers, ServerHandle } from './peers/server.js';
+
+// Outbound delivery.
+export { PendingStore, pingPeer, requestMsg, resolveTarget, sendMsg, statusOf } from './peers/outbound.js';
+export type { OutboundDeps, OutboundResult, ResolvedTarget } from './peers/outbound.js';
+
+// Inbound delivery.
+export { WakeLimiter, createHostDelivery, formatPeerText, processWakeAllowed } from './peers/inbound.js';
+
+// Agent tool surface.
+export { registerPeerTools, renderReceipt } from './tools.js';
+export type { PeerToolDeps } from './tools.js';
+
+// Command surface.
+export { formatPeerLine, formatPeersText, registerPeersCommand } from './commands/peers.js';
+export type { PeersSnapshot } from './commands/peers.js';
+
+// Binding.
+export { createPeerBinding } from './peers/binding.js';
+export type { ActivityKind, PeerBinding } from './peers/binding.js';

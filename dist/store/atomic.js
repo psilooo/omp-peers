@@ -1,5 +1,5 @@
 /**
- * Windows-safe durability primitives.
+ * Durable JSON write primitives.
  *
  * The old plugin died on EPERM races when moving a fresh file over a live one,
  * so this module NEVER moves files over live targets. Target replacement is
@@ -11,7 +11,7 @@
  *    mid-flight) with one bounded retry.
  */
 import { randomBytes } from 'node:crypto';
-import { copyFile, mkdir, open, readFile, readdir, stat, unlink, } from 'node:fs/promises';
+import { chmod, copyFile, lstat, mkdir, open, readFile, readdir, stat, unlink, } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { CorruptStateError } from '../errors.js';
 /** Sidecars older than this are swept after a successful write. */
@@ -24,15 +24,8 @@ function hasErrno(err, code) {
         'code' in err &&
         err.code === code);
 }
-/** Memoized per-process parent-directory creation. */
-const ensuredParents = new Set();
 async function ensureParent(filePath) {
-    const dir = dirname(filePath);
-    if (ensuredParents.has(dir)) {
-        return;
-    }
-    await mkdir(dir, { recursive: true });
-    ensuredParents.add(dir);
+    await mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
 }
 /**
  * Read and parse one JSON file. Missing file → undefined. A read that lands
@@ -101,7 +94,7 @@ async function sweepStaleSidecars(target) {
         }));
     }
     catch {
-        // Directory missing or unreadable — sweep is best effort.
+        // Directory missing or unreadable: sweep is best effort.
     }
 }
 /**
@@ -109,15 +102,20 @@ async function sweepStaleSidecars(target) {
  * fsync it, copy it over the target, delete the sidecar. The sidecar never
  * coexists with a move over a live file: the target is replaced in place by
  * the copy, so any reader sees either the old or the new content.
+ *
+ * `mode` (default 0600) applies to the sidecar and is enforced on the target
+ * after the copy so records keep their owner-only permission even when a
+ * pre-existing target carried different bits.
  */
 export async function durableWriteJson(filePath, data, opts = {}) {
     await ensureParent(filePath);
+    const mode = opts.mode ?? 0o600;
     const text = JSON.stringify(data, null, opts.pretty === false ? undefined : 2) + '\n';
     let attempt = 0;
     for (;;) {
         const sidecar = sidecarPathFor(filePath);
         try {
-            const fh = await open(sidecar, 'wx', 0o600);
+            const fh = await open(sidecar, 'wx', mode);
             try {
                 await fh.writeFile(text, 'utf8');
                 await fh.sync();
@@ -127,6 +125,7 @@ export async function durableWriteJson(filePath, data, opts = {}) {
             }
             await copyFile(sidecar, filePath);
             await unlink(sidecar).catch(() => undefined);
+            await chmod(filePath, mode).catch(() => undefined);
             await sweepStaleSidecars(filePath);
             return;
         }
@@ -139,11 +138,47 @@ export async function durableWriteJson(filePath, data, opts = {}) {
                 continue;
             }
             if (hasErrno(err, 'EEXIST') && attempt < 3) {
-                // Sidecar name collision (astronomically unlikely) — new nonce next try.
+                // Sidecar name collision (astronomically unlikely): new nonce next try.
                 attempt += 1;
                 continue;
             }
             throw err;
         }
+    }
+}
+/**
+ * Read one file as raw text under a hard byte bound. Returns undefined for a
+ * missing or unreadable file, a non-regular file (lstat, so symlinks and
+ * sockets are rejected without following them), or content over maxBytes.
+ * Reads at most maxBytes + 1 bytes so a file that grows past the bound
+ * between stat and read is rejected rather than truncated.
+ */
+export async function readJsonBounded(filePath, maxBytes) {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+        return undefined;
+    }
+    try {
+        const stats = await lstat(filePath);
+        if (!stats.isFile()) {
+            return undefined;
+        }
+        if (stats.size > maxBytes) {
+            return undefined;
+        }
+        const fh = await open(filePath, 'r');
+        try {
+            const buf = Buffer.allocUnsafe(maxBytes + 1);
+            const { bytesRead } = await fh.read(buf, 0, maxBytes + 1, 0);
+            if (bytesRead > maxBytes) {
+                return undefined;
+            }
+            return buf.subarray(0, bytesRead).toString('utf8');
+        }
+        finally {
+            await fh.close();
+        }
+    }
+    catch {
+        return undefined;
     }
 }

@@ -1,14 +1,7 @@
 /**
- * Roster — identity + peer list injected on the host `context` event.
- *
- * The event payload's messages are a provider-bound clone that never reaches
- * the transcript, so appending to the last user message keeps provider role
- * alternation and the cached prompt prefix intact (verified pattern from the
- * bridge reference). The note is always injected — even with no peers — so
- * the agent always knows its own peer name; rows degrade to a solo line.
+ * Roster: the record-only `<peers>` note and the pure context transform that
+ * folds it into a provider-bound message list.
  */
-import type { PeerRecord } from '../types.js';
-export type RosterMode = 'hub' | 'tools';
 export interface RosterMessage {
     role: string;
     content: string | Array<{
@@ -16,11 +9,30 @@ export interface RosterMessage {
         text?: string;
     }>;
 }
-/** Identity line + contact rule + peer definition + one row per peer (solo compacts to two lines). */
-export declare function buildPeersNote(ownName: string, peers: PeerRecord[], mode: RosterMode): string;
+export interface RosterRow {
+    name: string;
+    project: string;
+    busy: boolean;
+    beatAge: string;
+    /** Optional bounded detail from an authenticated status pull only (never from presence records). */
+    detail?: {
+        model?: string;
+        activity?: string;
+        todoCount?: number;
+    };
+}
+/** Strip control characters (C0, DEL, C1, bidi/format overrides), CR/LF, and ANSI escapes; escape markdown backticks; clamp UTF-8 bytes. */
+export declare function sanitizeDisplay(raw: string, maxBytes: number): string;
+/**
+ * Render the automatic `<peers>` note: identity line plus one record-only row
+ * per peer (name, project, busy, beat age) and the untrusted-data label. No
+ * token, cwd, session id, model, activity, or todos ever enter this note.
+ */
+export declare function buildPeersNote(ownName: string, rows: RosterRow[]): string;
 /**
  * Fold `note` into the last user message (string content is suffixed, array
- * content is pushed) or append a fresh user message when none exists.
- * Mutates `messages` in place and returns it.
+ * content gets a pushed text part) or append a fresh user message when none
+ * exists. Pure: returns a new array with a copied target message/content,
+ * leaves the input and unsupported content unchanged.
  */
-export declare function appendNoteToMessages(messages: RosterMessage[], note: string): RosterMessage[];
+export declare function withRosterNote(messages: RosterMessage[], note: string): RosterMessage[];

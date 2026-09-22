@@ -1,21 +1,25 @@
 {
   "name": "omp-peers",
   "owner": {
-    "name": "Nikko Gonzales"
+    "name": "psilooo"
   },
   "metadata": {
-    "description": "Cross-session peer awareness for omp/pi",
-    "version": "1.4.0"
+    "description": "Cross-session peer awareness for omp.",
+    "version": "2.0.0"
   },
   "plugins": [
     {
       "name": "omp-peers",
-      "source": "./",
-      "version": "1.4.0",
-      "description": "Every running omp/pi instance sees the others by peer name and can prompt them via peer_send.",
+      "source": {
+        "source": "github",
+        "repo": "psilooo/omp-peers",
+        "ref": "v2.0.0"
+      },
+      "version": "2.0.0",
+      "description": "Every running top-level omp instance sees the others by peer name and can prompt them via peer_send.",
       "category": "development",
       "license": "MIT",
-      "keywords": ["multi-agent", "peer-discovery", "cross-session", "peers", "oh-my-pi"]
+      "keywords": ["multi-agent", "peer-discovery", "cross-session", "peers", "omp"]
     }
   ]
 }

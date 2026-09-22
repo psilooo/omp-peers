@@ -1,49 +1,39 @@
 /**
- * Peer-name validation and cross-process deconfliction.
- *
- * A peer name is an address: `^[\w.-]{1,24}$`. `Main` is refused
- * (case-sensitive exact match — it names the host's driving agent and must
- * never be taken by a peer), as is any live local subagent id handed in via
- * `localIds`. Cross-process collisions resolve first-wins by `startedAt`;
- * the younger instance auto-suffixes `-<pid>`.
+ * Peer identity generation, project metadata, and cross-process name
+ * deconfliction (plan section 3). Canonical name rules and alias/default
+ * name construction live in `protocol.js`; this module owns the contention
+ * decision: (startedAt, pid, instance) ascending owns a contested name and
+ * each loser falls back to the stable alias for its own instance.
  */
-import type { PeerRecord } from '../types.js';
-export declare const PEER_NAME_PATTERN: RegExp;
-export declare function isValidPeerName(name: string): boolean;
-/** Throw {@link PeerNameError} unless `name` is usable as a peer address. */
-export declare function validatePeerName(name: string, opts?: {
-    localIds?: Iterable<string>;
-}): void;
-/** Default address for an instance: sanitized `<basename(cwd)>-<pid>`. */
-export declare function defaultPeerName(cwd: string, pid: number): string;
-/**
- * Derive a peer address from the host session name. A session name qualifies
- * as an address ONLY in raw form: non-empty, matching
- * {@link PEER_NAME_PATTERN} (1-24 of a-z A-Z 0-9 _ . -), and not the refused
- * host name `Main`. Anything else falls back to {@link defaultPeerName} with
- * `rejected` carrying the raw name so the caller can warn once — except
- * model-generated titles (`titleSource` `"auto"`), which fall back silently:
- * they express no user intent and the host rewrites them. Cross-process
- * collisions still resolve later via {@link resolvePeerName}.
- */
-export declare function peerNameFromSession(raw: string | undefined, cwd: string, pid: number, opts?: {
-    titleSource?: string;
-}): {
-    name: string;
-    rejected?: string;
+import type { PeerIdentity, PeerRecordV2 } from './protocol.js';
+/** One fresh instance identity: canonical hex instance plus capability token. */
+export declare function newIdentity(): {
+    instance: string;
+    token: string;
 };
+/**
+ * Sanitized basename of the project directory: control characters and path
+ * separators stripped, 1-64 UTF-8 bytes, `peer` when nothing usable remains.
+ * Never returns an absolute path.
+ */
+export declare function projectFor(cwd: string): string;
 export interface ResolveNameInput {
-    candidate: string;
-    pid: number;
-    startedAt: number;
-    peers: PeerRecord[];
-    /** Live local subagent ids — treated as held, like an older peer. */
-    localIds?: Iterable<string>;
+    requested: string;
+    self: PeerIdentity & {
+        startedAt: number;
+    };
+    peers: PeerRecordV2[];
 }
 /**
- * First-wins by `startedAt`: when another live peer holds `candidate` and
- * started no later than us (or a local id holds it), take `<candidate>-<pid>`.
- * The suffixed form is intentionally exempt from the 24-char cap so it stays
- * deterministic and searchable.
+ * Resolve a contested name: (startedAt, pid, instance) ascending among the
+ * requester and every fresh peer already holding the normalized candidate
+ * decides ownership; a losing requester falls back to `aliasNameFor` of its
+ * own instance. An unusable or reserved request resolves directly to that
+ * alias. Same input set always converges to the same owner on every process.
  */
-export declare function resolvePeerName(input: ResolveNameInput): string;
+export declare function resolveName(input: ResolveNameInput): {
+    name: string;
+    aliased: boolean;
+};
+/** True when two or more fresh peers share a routable name (ambiguous target). */
+export declare function hasDuplicateRoutableNames(peers: PeerRecordV2[]): boolean;
