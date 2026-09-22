@@ -1653,8 +1653,12 @@ describe('router, replies, and FIFO batching', () => {
       const call = fake.calls.sendUserMessage[0];
       assert.equal(call.options.attribution, 'agent', 'every relayed submission is attributed to the agent');
       assert.equal(call.options.deliverAs, undefined, 'under the wake budget the call is immediate, not a followUp');
-      const expected = bodies.map((body, i) => formatPeerText('alpha', body, { id: ids[i] })).join('\n');
-      assert.equal(call.content, expected, 'rendered bodies are joined by exactly one newline');
+      // Two separate connections have no cross-arrival order: the batch
+      // renders both bodies newline-joined in whichever order they arrived.
+      const rendered = bodies.map((body, i) => formatPeerText('alpha', body, { id: ids[i] })).sort();
+      const actual = call.content.split('\n').sort();
+      assert.deepEqual(actual, rendered, 'rendered bodies are joined by exactly one newline');
+      assert.equal(call.content.split('\n').length, 2, 'exactly one newline joins the two bodies');
 
       const codes = [];
       for (const raw of raws) codes.push(terminalCode(await raw.nextLine()));
@@ -2718,6 +2722,254 @@ describe('real child processes over unix sockets', () => {
     } finally {
       await alpha.stop();
       await beta.stop();
+    }
+  });
+});
+
+describe('review-fix regressions', () => {
+  let roots;
+  let requester;
+
+  before(async () => {
+    roots = await makeRoots('review-fix');
+    requester = makeIdentity(48600);
+    await putRecord(roots, requester, { name: 'self' });
+  });
+
+  it('routes send to a generated alias name that resolves to one live record', async () => {
+    // Regression: reserved-name validation wrongly rejected the p-<22hex>
+    // aliases resolveName assigns to collision losers, so displayed peers
+    // were unreachable through every outbound gate.
+    const target = makeIdentity(48601);
+    const alias = aliasNameFor(target.instance);
+    assert.equal(isValidPeerName(alias), false, 'aliases stay reserved for name assignment');
+    await putRecord(roots, target, { name: alias });
+    const timers = makeTimers();
+    const { delivery, state } = makeDelivery();
+    const server = await startTestServer({ roots, identity: target, delivery, timers });
+    try {
+      const { deps } = makeDeps({
+        roots,
+        identity: requester,
+        timers,
+        scan: async () => [memoryRecord(target, { name: alias })],
+      });
+      const inFlight = sendMsg(deps, alias, 'hello alias');
+      await waitFor(() => state.delivered.length >= 1, { label: 'alias delivery' });
+      expectCode(await inFlight, 'submitted');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('retains an acknowledged held batch across a canceled transition', { timeout: 30000 }, async () => {
+    // Regression: the held pump discarded acknowledged batches during a
+    // pending (fenced but uncommitted) transition, losing them forever when
+    // the transition was canceled or rolled back.
+    const receiver = makeIdentity(48602);
+    await putRecord(roots, receiver, { name: 'held-recv' });
+    const timers = makeTimers();
+    const { delivery, state } = makeDelivery();
+    state.canSubmit = false;
+    const server = await startTestServer({ roots, identity: receiver, delivery, timers });
+    try {
+      const sender = openRaw(server.endpoint);
+      await sender.connect();
+      const hs = await verifiedHandshake(sender, receiver);
+      sender.send(
+        requestFrame({
+          ...hs,
+          sender: requester,
+          receiver,
+          payload: { type: 'msg', body: 'held across cancel', hop: 0 },
+        })
+      );
+      assert.equal(terminalCode(await sender.nextLine()), 'held', 'the blocked batch is acknowledged held exactly once');
+      await waitFor(() => state.heldReserves >= 1, { label: 'held reservation' });
+
+      state.acceptance = 'session_transition';
+      await sleep(COALESCE_MS * 3);
+      assert.equal(state.delivered.length, 0, 'nothing submits during the pending fence');
+      assert.equal(state.releases, 0, 'the held reservation survives the pending fence');
+
+      state.acceptance = 'accepting';
+      state.canSubmit = true;
+      // The harness's real intervals are one-shot: fire the remaining manual
+      // drivers (the hold-timeout force) to run the pump after the cancel.
+      timers.fireAll();
+      await waitFor(() => state.delivered.length >= 1, { timeout: 8000, label: 'held batch delivered after cancel' });
+      assert.equal(state.delivered.length, 1, 'the acknowledged batch submits exactly once');
+      sender.close();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('retries exactly one torn presence read and keeps persistent garbage unusable', async () => {
+    // Regression: records are overwritten in place, so a concurrent heartbeat
+    // can expose a torn body; the reader must reread once after 50 ms and
+    // only then give up.
+    const target = makeIdentity(48603);
+    const path = peerRecordPath(roots, target.pid, target.instance);
+    await putRecord(roots, target, { name: 'torn' });
+    await writeFile(path, '{"v":2,"pid":');
+    const heal = (async () => {
+      await sleep(10);
+      await putRecord(roots, target, { name: 'torn' });
+    })();
+    const recovered = await readPeerRecord(roots, target.pid, target.instance);
+    await heal;
+    assert.ok(recovered !== undefined && recovered.name === 'torn', 'the bounded reread picks up the healed body');
+    await writeFile(path, '{"v":2,"pid":');
+    assert.equal(
+      await readPeerRecord(roots, target.pid, target.instance),
+      undefined,
+      'a second unusable read stays unusable'
+    );
+  });
+
+  it('computes the hop per attempt against the actually resolved record', async () => {
+    // Regression: the hop was computed in a throwaway resolution, so a
+    // retargeted retry could send under another identity's hop level.
+    const dead = makeIdentity(48604);
+    const alive = makeIdentity(48605);
+    await putRecord(roots, alive, { name: 'hop-target' });
+    const hops = [];
+    const sink = await makeOutboundServer(roots, alive, {
+      onLine(socket, line) {
+        if (line.startsWith('{"v":2,"type":"hello"')) {
+          answerHello(socket, line, alive);
+          return;
+        }
+        const request = JSON.parse(line);
+        hops.push(request.payload.hop);
+        socket.write(signedReply(alive, request.id, 'submitted'));
+      },
+    });
+    try {
+      const timers = makeTimers();
+      let calls = 0;
+      const { deps } = makeDeps({
+        roots,
+        identity: requester,
+        timers,
+        scan: async () => {
+          calls += 1;
+          return calls === 1 ? [memoryRecord(dead, { name: 'hop-target' })] : [memoryRecord(alive, { name: 'hop-target' })];
+        },
+      });
+      const result = await sendMsg(deps, 'hop-target', 'hop check', {
+        hopFor: (record) => (record.instance === alive.instance ? 1 : 2),
+      });
+      expectCode(result, 'submitted');
+      assert.deepEqual(hops, [1], 'the surviving attempt carries its own resolved record hop');
+    } finally {
+      await sink.stop();
+    }
+  });
+
+  it('keeps hop state for peer-sourced entries and resets it for human entries', { timeout: 30000 }, async () => {
+    // Regression: peer-injected entries reset the relay-hop chain (loop
+    // protection bypass) and the same-peer reply exemption compared a
+    // pid:instance key against a peer name (never matching). The real
+    // extension drives the classification from each host entry's fields.
+    const hopRoots = await ensureStateRoots({ OMP_PEERS_DIR: join(ROOT_TMP, 'hop-origin') });
+    const peer = makeIdentity();
+    const sinkIdent = makeIdentity();
+    await putRecord(hopRoots, peer, { name: 'sender' });
+    await putRecord(hopRoots, sinkIdent, { name: 'sink' });
+    const hops = [];
+    const scripted = (identity, label) => ({
+      onLine(socket, line) {
+        if (line.startsWith('{"v":2,"type":"hello"')) {
+          answerHello(socket, line, identity);
+          return;
+        }
+        const request = JSON.parse(line);
+        hops.push({ to: label, hop: request.payload.hop });
+        socket.write(signedReply(identity, request.id, 'submitted'));
+      },
+    });
+    const sinkServer = await makeOutboundServer(hopRoots, sinkIdent, scripted(sinkIdent, 'sink'));
+    const peerServer = await makeOutboundServer(hopRoots, peer, scripted(peer, 'sender'));
+    const previousDir = process.env.OMP_PEERS_DIR;
+    process.env.OMP_PEERS_DIR = join(ROOT_TMP, 'hop-origin');
+    const extension = (await import('../dist/extension.js')).default;
+    const fake = createFakeHost();
+    const registered = new Map();
+    const originalRegister = fake.host.registerTool;
+    fake.host.registerTool = (tool) => {
+      originalRegister(tool);
+      registered.set(tool.name, tool);
+    };
+    try {
+      extension(fake.host);
+      await fake.emit('session_start', { reason: 'startup' });
+      await waitFor(
+        async () => {
+          const scan = await scanPeers(hopRoots, { pid: 999999, instance: generateInstance() });
+          return scan.routable.length >= 3 && registered.has('peer_send');
+        },
+        { label: 'the extension armed and registered the peer tools' }
+      );
+
+      const selfRecord = (await scanPeers(hopRoots, { pid: 999999, instance: generateInstance() })).routable
+        .find((record) => record.name !== 'sender' && record.name !== 'sink');
+      assert.ok(selfRecord !== undefined, 'the binding published its own record');
+
+      // Each seed delivers one peer message at hop 3 to the binding's own
+      // endpoint, so lastInboundFrom is the sender identity at level 3.
+      const seed = async () => {
+        const inbound = openRaw(peerEndpoint(hopRoots, selfRecord.pid, selfRecord.instance));
+        await inbound.connect();
+        const hs = await verifiedHandshake(inbound, selfRecord);
+        inbound.send(
+          requestFrame({
+            ...hs,
+            sender: peer,
+            receiver: selfRecord,
+            payload: { type: 'msg', body: 'seeding hop state', hop: 3 },
+          })
+        );
+        assert.equal(terminalCode(await inbound.nextLine()), 'submitted', 'the seeding message is submitted');
+        inbound.close();
+      };
+      const runSend = (to, message, extra = {}) =>
+        registered.get('peer_send').execute(`fixture-${hops.length}`, { to, message, ...extra });
+
+      await seed();
+      await fake.emit('input', { source: 'extension', prompt: '[peer sender]: relayed' });
+      await runSend('sink', 'relayed on');
+      await fake.emit('input', { source: 'interactive', text: '[peer sender]: quoted by a human' });
+      await runSend('sink', 'human one');
+      await seed();
+      await fake.emit('before_agent_start', { prompt: '[peer sender]: injected turn' });
+      await runSend('sink', 'relayed again');
+      await fake.emit('before_agent_start', { prompt: 'ordinary human turn' });
+      await runSend('sink', 'human two');
+      await seed();
+      await fake.emit('input', { source: 'extension', prompt: '[peer sender]: injected again' });
+      await runSend('sender', 'same peer keeps level');
+      await runSend('sink', 'replyTo does not bypass', { replyTo: generateId() });
+
+      assert.deepEqual(
+        hops,
+        [
+          { to: 'sink', hop: 4 },
+          { to: 'sink', hop: 0 },
+          { to: 'sink', hop: 4 },
+          { to: 'sink', hop: 0 },
+          { to: 'sender', hop: 3 },
+          { to: 'sink', hop: 4 },
+        ],
+        'only human entries reset the chain; identity and hop comparisons are exact'
+      );
+    } finally {
+      if (previousDir === undefined) delete process.env.OMP_PEERS_DIR;
+      else process.env.OMP_PEERS_DIR = previousDir;
+      await fake.emit('session_shutdown', undefined);
+      await sinkServer.stop();
+      await peerServer.stop();
     }
   });
 });

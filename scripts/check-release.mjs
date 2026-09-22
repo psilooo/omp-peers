@@ -127,6 +127,22 @@ if (pkg) {
   }
 }
 
+let releaseWorkflow;
+try {
+  releaseWorkflow = readFileSync(join(root, '.github/workflows/release.yml'), 'utf8');
+} catch (error) {
+  fail(`.github/workflows/release.yml: not readable (${error.message})`);
+}
+if (releaseWorkflow !== undefined) {
+  // The verify job reads Actions run and job state through the API; the
+  // top-level token is least-privilege, so the job must grant actions: read.
+  const verifySection = releaseWorkflow.split(/\n  verify:\n/)[1] ?? '';
+  const jobBlock = verifySection.split(/\n  [a-z]/)[0] ?? '';
+  if (!/\bactions:\s*read\b/.test(jobBlock)) {
+    fail('.github/workflows/release.yml: the verify job must declare permissions with actions: read');
+  }
+}
+
 const marketplace = readJson('.omp-plugin/marketplace.json');
 if (marketplace) {
   const metaVersion = marketplace.metadata?.version;

@@ -250,8 +250,9 @@ async function removeDir(dir) {
 /**
  * Spawn one real child process running dist/extension.js behind the scripted
  * fake host. `ready` settles once the child reports armed and its presence
- * record exists; stop() shuts the child down and sweeps its leftovers, and
- * the same cleanup runs when ready fails.
+ * record exists; stop() shuts the child down and sweeps its leftovers,
+ * stopWithoutSweep() shuts down without sweeping so a test can observe the
+ * plugin's own cleanup first, and the same cleanup runs when ready fails.
  */
 export async function startChild(options) {
   assertSupportedPlatform();
@@ -406,13 +407,23 @@ export async function startChild(options) {
       await waitForExit(STOP_TIMEOUT_MS);
     }
     liveChildren.delete(child);
+  }
+
+  async function sweepOwnLeftovers() {
     await sweepPeerDir(peerDir, child.pid);
     if (createdDir) await rmdir(peerDir).catch(() => undefined);
   }
 
-  function stop() {
+  // Shuts the child down without sweeping so a test can inspect the plugin's
+  // own record and socket cleanup first; stop() still sweeps.
+  function stopWithoutSweep() {
     stopPromise ??= runStop();
     return stopPromise;
+  }
+
+  function stop() {
+    stopPromise ??= runStop();
+    return stopPromise.finally(sweepOwnLeftovers);
   }
 
   async function waitForRecord() {
@@ -462,6 +473,7 @@ export async function startChild(options) {
     invoke: (eventType, payload) => request({ cmd: 'emit', eventType, payload }),
     tool: (name, params) => request({ cmd: 'tool', name, params }),
     stop,
+    stopWithoutSweep,
   };
   return handle;
 }

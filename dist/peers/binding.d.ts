@@ -13,7 +13,7 @@ export interface PeerBinding {
     onSessionStart(ctx: CommandContextLike): void;
     onBeforeTransition(kind: 'switch' | 'branch' | 'tree', ctx: CommandContextLike): void;
     onTransition(kind: 'switch' | 'branch' | 'tree', event: unknown, ctx: CommandContextLike): void;
-    onCommitPoint(ctx: CommandContextLike): void;
+    onCommitPoint(ctx: CommandContextLike, human: boolean): void;
     onContext(event: unknown, ctx: CommandContextLike): {
         messages: RosterMessage[];
     } | undefined;
@@ -26,6 +26,6 @@ export interface PeerBinding {
         timeoutMs?: number;
     }): Promise<OutboundResult>;
     status(to: string): Promise<OutboundResult>;
-    shutdown(): void;
+    shutdown(): Promise<void>;
 }
 export declare function createPeerBinding(pi: ExtensionHostLike): PeerBinding;

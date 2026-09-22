@@ -5,7 +5,7 @@
  * resolves to a protocol result code; nothing throws into the agent turn.
  */
 import { createConnection } from 'node:net';
-import { BODY_MAX_BYTES, CHALLENGE_MAX_BYTES, HANDSHAKE_TIMEOUT_MS, HELLO_MAX_BYTES, MAX_HOP, MAX_OUTBOUND_SOCKETS, MAX_PENDING_REQUESTS, MAX_STATUS_FIELDS, PEER_NAME_PATTERN, PROTOCOL_VERSION, RECEIPT_TIMEOUT_MS, REPLY_MAX_BYTES, REQUEST_MAX_BYTES, REQUEST_TIMEOUT_DEFAULT_MS, REQUEST_TIMEOUT_MAX_MS, REQUEST_TIMEOUT_MIN_MS, canonicalRequestPayload, canonicalStatus, challengeMac, encodeLine, generateId, identityEquals, isCanonicalId, isRetryableRefusal, isSuccessCode, isValidPeerName, normalizeNameInput, parseChallenge, parseReply, replyMac, requestMac, verifyMac, } from './protocol.js';
+import { BODY_MAX_BYTES, CHALLENGE_MAX_BYTES, HANDSHAKE_TIMEOUT_MS, HELLO_MAX_BYTES, MAX_HOP, MAX_OUTBOUND_SOCKETS, MAX_PENDING_REQUESTS, MAX_STATUS_FIELDS, PEER_NAME_PATTERN, PROTOCOL_VERSION, RECEIPT_TIMEOUT_MS, REPLY_MAX_BYTES, REQUEST_MAX_BYTES, REQUEST_TIMEOUT_DEFAULT_MS, REQUEST_TIMEOUT_MAX_MS, REQUEST_TIMEOUT_MIN_MS, canonicalRequestPayload, canonicalStatus, challengeMac, encodeLine, generateId, identityEquals, isCanonicalId, isRetryableRefusal, isSuccessCode, isRoutablePeerName, normalizeNameInput, parseChallenge, parseReply, replyMac, requestMac, verifyMac, } from './protocol.js';
 import { hasDuplicateRoutableNames } from './ids.js';
 import { readPeerRecord } from './presence.js';
 import { peerEndpoint } from '../store/paths.js';
@@ -179,7 +179,7 @@ export async function resolveTarget(deps, to) {
     const known = [
         ...new Set(routable.filter((record) => !identityEquals(record, self)).map((record) => record.name)),
     ].sort();
-    if (name === '' || !PEER_NAME_PATTERN.test(name) || !isValidPeerName(name)) {
+    if (name === '' || !PEER_NAME_PATTERN.test(name) || !isRoutablePeerName(name)) {
         return { kind: 'missing', known };
     }
     const matches = routable.filter((record) => record.name === name);
@@ -579,7 +579,25 @@ async function performOperation(deps, to, payload, deadline, opts = {}) {
     }
     const id = opts.pendingId ?? generateId();
     for (let tries = 0;; tries += 1) {
-        const report = await attemptExchange(deps, record, payload, id, deadline, opts.pendingId, opts.budgetDeadline, closed);
+        let active = payload;
+        if (opts.hopFor !== undefined && payload.type === 'msg') {
+            const hop = opts.hopFor(record);
+            const target = identityOf(record);
+            if (!Number.isSafeInteger(hop) || hop < 0) {
+                return { code: 'invalid_request', detail: 'invalid hop', written: false, authenticated: false, target };
+            }
+            if (hop > MAX_HOP) {
+                return {
+                    code: 'invalid_request',
+                    detail: `relay chain is ${hop} hops from a human prompt; the limit is ${MAX_HOP}`,
+                    written: false,
+                    authenticated: false,
+                    target,
+                };
+            }
+            active = { ...payload, hop };
+        }
+        const report = await attemptExchange(deps, record, active, id, deadline, opts.pendingId, opts.budgetDeadline, closed);
         if (tries >= 1)
             return report;
         if (!mayRetry(report))
@@ -613,7 +631,7 @@ function validateAddress(to) {
     const name = normalizeNameInput(to ?? '');
     if (name === '' || !PEER_NAME_PATTERN.test(name))
         return { code: 'invalid_request', detail: 'invalid name' };
-    if (!isValidPeerName(name))
+    if (!isRoutablePeerName(name))
         return { code: 'invalid_request', detail: 'reserved name' };
     return { name };
 }
@@ -646,14 +664,16 @@ export async function sendMsg(deps, to, body, opts = {}) {
         if (bodyError !== undefined)
             return bodyError;
         const hop = opts.hop ?? 0;
-        if (!Number.isInteger(hop) || hop < 0 || hop > MAX_HOP) {
+        if (opts.hopFor === undefined && (!Number.isInteger(hop) || hop < 0 || hop > MAX_HOP)) {
             return { code: 'invalid_request', detail: 'invalid hop' };
         }
         if (opts.replyTo !== undefined && !isCanonicalId(opts.replyTo)) {
             return { code: 'invalid_request', detail: 'invalid replyTo' };
         }
         const payload = opts.replyTo !== undefined ? { type: 'msg', body, hop, replyTo: opts.replyTo } : { type: 'msg', body, hop };
-        const report = await performOperation(deps, address.name, payload, exchangeDeadline());
+        const report = await performOperation(deps, address.name, payload, exchangeDeadline(), {
+            ...(opts.hopFor !== undefined ? { hopFor: opts.hopFor } : {}),
+        });
         const afterState = acceptanceState(deps);
         if (afterState !== 'accepting')
             return { code: afterState };
@@ -684,15 +704,16 @@ export async function requestMsg(deps, to, body, opts = {}) {
         if (bodyError !== undefined)
             return bodyError;
         const hop = opts.hop ?? 0;
-        if (!Number.isSafeInteger(hop) || hop < 0) {
+        if (opts.hopFor === undefined && (!Number.isSafeInteger(hop) || hop < 0)) {
             return { code: 'invalid_request', detail: 'invalid hop' };
         }
-        if (hop > MAX_HOP) {
+        if (opts.hopFor === undefined && hop > MAX_HOP) {
             return { code: 'invalid_request', detail: `hop ${hop} exceeds limit ${MAX_HOP}` };
         }
         const payload = { type: 'msg', body, hop };
         report = await performOperation(deps, address.name, payload, deadline, {
             pendingId: id,
+            ...(opts.hopFor !== undefined ? { hopFor: opts.hopFor } : {}),
             onReserved: (promise) => {
                 replyPromise = promise;
             },

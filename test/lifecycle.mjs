@@ -1411,7 +1411,10 @@ describe('child shutdown settlement', () => {
       // Let the request land and become owed, well inside the coalesce window.
       await sleep(150);
 
-      await child.stop();
+      // Stop without the fixture sweep so the cleanup assertions below see
+      // only the plugin's own record and socket deletion; the sweep runs in
+      // the finally block instead, where it can never satisfy them.
+      await child.stopWithoutSweep();
       assert.equal(terminalCode(await raw.nextLine()), 'shutting_down', 'the owed socket settles with shutting_down');
       await sleep(600);
       assert.equal(replyCount(raw), 1, 'shutdown settles the socket exactly once');

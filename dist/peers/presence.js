@@ -15,8 +15,10 @@
  *  - every path comes from the trusted roots plus a validated (pid,
  *    instance), never from record content.
  */
+import { unlinkSync } from 'node:fs';
 import { lstat, opendir, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
+import { setTimeout as delayMs } from 'node:timers/promises';
 import { durableWriteJson, readJsonBounded } from '../store/atomic.js';
 import { peerEndpoint, peerRecordPath } from '../store/paths.js';
 import { MAX_DIR_ENTRIES, MAX_ROUTABLE_PEERS, RECORD_MAX_BYTES, isCanonicalInstance, isRecordFresh, parseRecord, } from './protocol.js';
@@ -68,6 +70,26 @@ async function unlinkQuiet(path) {
         // Absent or not removable; cleanup paths never propagate errors.
     }
 }
+const READ_RETRY_DELAY_MS = 50;
+/**
+ * One bounded reread for transient torn reads: records are overwritten in
+ * place, so a concurrent heartbeat can expose a partial body. A second
+ * unusable read stays unusable; byte, ownership, identity, and freshness
+ * checks are all preserved by the callers.
+ */
+async function readParsedRecord(path) {
+    let parsed;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        const raw = await readJsonBounded(path, RECORD_MAX_BYTES);
+        parsed = raw === undefined ? undefined : parseRecord(raw);
+        if (parsed !== undefined && parsed.kind !== 'malformed')
+            return parsed;
+        if (attempt === 0) {
+            await delayMs(READ_RETRY_DELAY_MS);
+        }
+    }
+    return parsed;
+}
 function parseEntryName(name) {
     const v2 = V2_ENTRY_NAME.exec(name);
     if (v2 !== null) {
@@ -92,12 +114,11 @@ async function classifyEntry(roots, self, now, name) {
     const isSelf = id.instance !== null && id.pid === self.pid && id.instance === self.instance;
     const liveness = isSelf ? 'alive' : probePid(id.pid);
     const readable = await recordFileOk(recordPath);
-    const raw = readable ? await readJsonBounded(recordPath, RECORD_MAX_BYTES) : undefined;
-    const parsed = raw === undefined ? undefined : parseRecord(raw);
+    const parsed = readable ? await readParsedRecord(recordPath) : undefined;
     if (liveness === 'dead') {
         // Never delete a future version, and never delete what cannot be read:
         // either could belong to a newer plugin.
-        if (raw === undefined || parsed === undefined || parsed.kind === 'future') {
+        if (parsed === undefined || parsed.kind === 'future') {
             return undefined;
         }
         await unlinkQuiet(recordPath);
@@ -202,12 +223,8 @@ export async function readPeerRecord(roots, pid, instance, now = Date.now()) {
     if (!(await recordFileOk(path))) {
         return undefined;
     }
-    const raw = await readJsonBounded(path, RECORD_MAX_BYTES);
-    if (raw === undefined) {
-        return undefined;
-    }
-    const parsed = parseRecord(raw);
-    if (parsed.kind !== 'v2') {
+    const parsed = await readParsedRecord(path);
+    if (parsed === undefined || parsed.kind !== 'v2') {
         return undefined;
     }
     const record = parsed.record;
@@ -236,6 +253,27 @@ export async function removeOwnRecord(roots, pid, instance) {
     }
     await unlinkQuiet(peerRecordPath(roots, pid, instance));
     await unlinkQuiet(peerEndpoint(roots, pid, instance));
+}
+/**
+ * Synchronous teardown twin for the shutdown path: the host may exit the
+ * moment the shutdown handler returns, so the own record and endpoint must be
+ * gone before that. Same identity validation and silent-absence semantics.
+ */
+export function removeOwnRecordSync(roots, pid, instance) {
+    if (!Number.isInteger(pid) || pid < 1 || pid > PID_MAX) {
+        return;
+    }
+    if (!isCanonicalInstance(instance)) {
+        return;
+    }
+    for (const path of [peerRecordPath(roots, pid, instance), peerEndpoint(roots, pid, instance)]) {
+        try {
+            unlinkSync(path);
+        }
+        catch {
+            // Absent or not removable; teardown never propagates errors.
+        }
+    }
 }
 /** `3s ago` / `12m ago` / `2h ago` for the `/peers` beat-age column. */
 export function formatBeatAge(beatAt, now = Date.now()) {

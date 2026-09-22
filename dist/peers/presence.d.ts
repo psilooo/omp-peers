@@ -47,5 +47,11 @@ export declare function readPeerRecord(roots: StateRoots, pid: number, instance:
  * a path; unlink failures never propagate.
  */
 export declare function removeOwnRecord(roots: StateRoots, pid: number, instance: string): Promise<void>;
+/**
+ * Synchronous teardown twin for the shutdown path: the host may exit the
+ * moment the shutdown handler returns, so the own record and endpoint must be
+ * gone before that. Same identity validation and silent-absence semantics.
+ */
+export declare function removeOwnRecordSync(roots: StateRoots, pid: number, instance: string): void;
 /** `3s ago` / `12m ago` / `2h ago` for the `/peers` beat-age column. */
 export declare function formatBeatAge(beatAt: number, now?: number): string;

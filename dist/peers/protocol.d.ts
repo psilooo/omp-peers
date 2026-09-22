@@ -72,6 +72,11 @@ export declare function identityEquals(a: PeerIdentity, b: PeerIdentity): boolea
 export declare const PEER_NAME_PATTERN: RegExp;
 /** True for usable user-facing names; rejects `all`, `main`, and `p-<22 hex>` aliases. */
 export declare function isValidPeerName(name: string): boolean;
+/**
+ * True for routable destination names: user-facing names plus the generated
+ * collision aliases, which stay reserved for name assignment but addressable.
+ */
+export declare function isRoutablePeerName(name: string): boolean;
 /** Trim, lowercase, strip control characters; empty string when unusable. */
 export declare function normalizeNameInput(raw: string): string;
 /** Stable collision alias: `p-` plus the first 22 hex chars of sha256 of the full instance. */

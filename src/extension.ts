@@ -92,16 +92,22 @@ export default function peersExtension(pi: ExtensionHostLike): void {
   on('session_tree', (event, ctx) => {
     binding.onTransition('tree', event, ctx);
   });
-  on('session_shutdown', () => {
-    binding.shutdown();
-  });
+  on('session_shutdown', () => binding.shutdown());
   // The 'context' hook is registered by the binding itself, only after a
   // successful top-level arm (plan sections 2 and 4).
-  on('input', (_event, ctx) => {
-    binding.onCommitPoint(ctx);
+  on('input', (event, ctx) => {
+    // Host contract: InputEvent.source is 'interactive' | 'rpc' | 'extension';
+    // only extension-sourced entries fail to reset the hop chain.
+    const source = (event as { source?: unknown } | undefined)?.source;
+    binding.onCommitPoint(ctx, source !== 'extension');
   });
-  on('before_agent_start', (_event, ctx) => {
-    binding.onCommitPoint(ctx);
+  on('before_agent_start', (event, ctx) => {
+    // BeforeAgentStartEvent carries no origin field; a peer delivery always
+    // renders with the '[peer ' marker (formatPeerText), a human prompt does
+    // not. Keep transition bookkeeping either way.
+    const prompt = (event as { prompt?: unknown } | undefined)?.prompt;
+    const text = typeof prompt === 'string' ? prompt : '';
+    binding.onCommitPoint(ctx, !text.trimStart().startsWith('[peer '));
   });
   on('tool_execution_start', (event, ctx) => {
     binding.onActivity?.('tool_start', event, ctx);

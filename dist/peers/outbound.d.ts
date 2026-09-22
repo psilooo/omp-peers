@@ -67,10 +67,12 @@ export declare function resolveTarget(deps: OutboundDeps, to: string): Promise<R
 export declare function sendMsg(deps: OutboundDeps, to: string, body: string, opts?: {
     replyTo?: string;
     hop?: number;
+    hopFor?: (record: PeerRecordV2) => number;
 }): Promise<OutboundResult>;
 export declare function requestMsg(deps: OutboundDeps, to: string, body: string, opts?: {
     timeoutMs?: number;
     hop?: number;
+    hopFor?: (record: PeerRecordV2) => number;
 }): Promise<OutboundResult>;
 export declare function statusOf(deps: OutboundDeps, to: string, fields: string[], budget?: {
     deadlineAt: number;

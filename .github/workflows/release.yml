@@ -18,6 +18,9 @@ permissions:
 jobs:
   verify:
     runs-on: macos-latest
+    permissions:
+      contents: read
+      actions: read
     outputs:
       version: ${{ steps.pack.outputs.version }}
     steps:
@@ -91,10 +94,10 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$EXPECTED_COMMIT&status=completed&per_page=100" \
             > "$RUNNER_TEMP/ci-runs.json"
           RUN_ID=$(jq -r --arg t "$DISPATCH_AT" \
-            '[.workflow_runs[] | select(.completed_at != null and .completed_at < $t)] | sort_by(.run_number) | (last // {}) | .id // empty' \
+            '[.workflow_runs[] | select(.status == "completed" and .conclusion == "success" and .updated_at < $t)] | sort_by(.run_number) | (last // {}) | .id // empty' \
             "$RUNNER_TEMP/ci-runs.json")
           if [ -z "$RUN_ID" ]; then
-            echo "no completed CI run on $EXPECTED_COMMIT finished before this dispatch"
+            echo "no successful CI run on $EXPECTED_COMMIT completed before this dispatch"
             exit 1
           fi
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" > "$RUNNER_TEMP/ci-jobs.json"

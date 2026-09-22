@@ -18,7 +18,6 @@ import {
   identityKey,
   isValidPeerName,
   isSuccessCode,
-  MAX_HOP,
   MAX_STATUS_ACTIVITY_BYTES,
   MAX_STATUS_TEXT_BYTES,
   MAX_STATUS_TODOS,
@@ -31,7 +30,7 @@ import {
   type StatusSnapshot,
 } from './protocol.js';
 import { newIdentity, projectFor, resolveName } from './ids.js';
-import { formatBeatAge, readPeerRecord, removeOwnRecord, scanPeers, writeOwnRecord, type PeerScan } from './presence.js';
+import { formatBeatAge, readPeerRecord, removeOwnRecord, removeOwnRecordSync, scanPeers, writeOwnRecord, type PeerScan } from './presence.js';
 import { managedTimers, readBusy, readNativeTodos, readSessionName } from './host.js';
 import type { CommandContextLike, ExtensionHostLike } from './host.js';
 import { createHostDelivery, WakeLimiter } from './inbound.js';
@@ -62,7 +61,7 @@ export interface PeerBinding {
   onSessionStart(ctx: CommandContextLike): void;
   onBeforeTransition(kind: 'switch' | 'branch' | 'tree', ctx: CommandContextLike): void;
   onTransition(kind: 'switch' | 'branch' | 'tree', event: unknown, ctx: CommandContextLike): void;
-  onCommitPoint(ctx: CommandContextLike): void; // local input/command, peer-tool execution, context, before_agent_start
+  onCommitPoint(ctx: CommandContextLike, human: boolean): void; // human entries reset hops; peer-sourced entries keep them
   onContext(event: unknown, ctx: CommandContextLike): { messages: RosterMessage[] } | undefined;
   // Extension-only wiring for the bounded activity/todo feed that statusSnapshot renders.
   onActivity?(kind: ActivityKind, event: unknown, ctx: CommandContextLike): void;
@@ -70,7 +69,7 @@ export interface PeerBinding {
   send(to: string, body: string, opts: { replyTo?: string }): Promise<OutboundResult>;
   request(to: string, body: string, opts: { timeoutMs?: number }): Promise<OutboundResult>;
   status(to: string): Promise<OutboundResult>;
-  shutdown(): void;
+  shutdown(): Promise<void>;
 }
 
 export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
@@ -1008,9 +1007,10 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
     candidateKey = keyOf(ctx);
   }
 
-  function onCommitPoint(ctx: CommandContextLike): void {
-    // Local input and pre-agent prompts are human entries: hop chain resets.
-    commitPoint(ctx, true);
+  function onCommitPoint(ctx: CommandContextLike, human: boolean): void {
+    // Human entries reset the relay-hop chain; peer-sourced entries keep the
+    // inbound hop context so relay loops stay bounded.
+    commitPoint(ctx, human);
   }
 
   function onContext(event: unknown, ctx: CommandContextLike): { messages: RosterMessage[] } | undefined {
@@ -1103,10 +1103,15 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
 
   // --- Tool surface: peer-tool executions are commit points.
 
-  function hopFor(to: string, replyTo: string | undefined): number {
+  /**
+   * Relay-hop level for one outbound attempt: a send back to the last inbound
+   * peer identity keeps that message's level; any other target advances by
+   * one from the human prompt. The comparison is identity-to-identity and is
+   * computed per attempt against the actually resolved record.
+   */
+  function hopForRecord(record: PeerRecordV2): number {
     if (lastInboundFrom === undefined) return 0;
-    if ((replyTo !== undefined && replyTo !== '') || to === lastInboundFrom) return lastInboundHop;
-    return lastInboundHop + 1;
+    return identityKey(record) === lastInboundFrom ? lastInboundHop : lastInboundHop + 1;
   }
 
   async function send(to: string, body: string, opts: { replyTo?: string }): Promise<OutboundResult> {
@@ -1116,17 +1121,10 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
     const deps = depsRef;
     if (deps === undefined) return { code: 'host_unavailable', detail: notArmedText() };
     const replyTo = opts?.replyTo;
-    const hop = hopFor(to, replyTo);
-    if (hop > MAX_HOP) {
-      return {
-        code: 'invalid_request',
-        detail: `relay chain is ${hop} hops from a human prompt; the limit is ${MAX_HOP}`,
-      };
-    }
     try {
       return await sendMsg(deps, to, body, {
         ...(replyTo !== undefined && replyTo !== '' ? { replyTo } : {}),
-        hop,
+        hopFor: hopForRecord,
       });
     } catch (err) {
       log(`send failed: ${messageOf(err)}`);
@@ -1141,18 +1139,13 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
     const deps = depsRef;
     if (deps === undefined) return { code: 'host_unavailable', detail: notArmedText() };
     const timeoutMs = opts?.timeoutMs;
-    // Same hop semantics as the send path: a reply to the last inbound peer
-    // keeps its level, any other target advances by one, a fresh chain after
-    // a human prompt is 0.
-    const hop = hopFor(to, undefined);
-    if (hop > MAX_HOP) {
-      return {
-        code: 'invalid_request',
-        detail: `relay chain is ${hop} hops from a human prompt; the limit is ${MAX_HOP}`,
-      };
-    }
+    // Same hop semantics as the send path: the hop is computed per attempt
+    // against the resolved destination identity.
     try {
-      return await requestMsg(deps, to, body, { ...(timeoutMs !== undefined ? { timeoutMs } : {}), hop });
+      return await requestMsg(deps, to, body, {
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        hopFor: hopForRecord,
+      });
     } catch (err) {
       log(`request failed: ${messageOf(err)}`);
       return { code: 'unknown_outcome', detail: bounded(messageOf(err)) };
@@ -1175,8 +1168,9 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
 
   // --- Shutdown.
 
-  function shutdown(): void {
-    if (closed) return;
+  let shutdownPromise: Promise<void> | undefined;
+  function shutdown(): Promise<void> {
+    if (shutdownPromise !== undefined) return shutdownPromise;
     closed = true;
     bindingEpoch += 1;
     arming = false;
@@ -1194,8 +1188,15 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
     } catch {
       // PendingStore settles synchronously.
     }
+    // Own state is gone synchronously; the returned promise then drains
+    // tracked writes and re-removes afterward, and the host awaits it (the
+    // runner caps session_shutdown handlers at 2,000 ms).
+    if (roots !== undefined && identity !== undefined) {
+      removeOwnRecordSync(roots, identity.pid, identity.instance);
+    }
     resolveShutdown();
-    void finalize();
+    shutdownPromise = finalize();
+    return shutdownPromise;
   }
 
   async function finalize(): Promise<void> {

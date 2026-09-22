@@ -270,21 +270,28 @@ export function startPeerServer(opts) {
         try {
             while (!closing && heldFifo.length > 0) {
                 const head = heldFifo[0];
-                if (acceptanceState() !== 'accepting') {
-                    warn(`peers: discarded ${head.envelopes.length} retained message(s); the binding is not accepting`);
+                if (staleEpoch(head.envelopes[0].epoch)) {
+                    warn(`peers: discarded ${head.envelopes.length} retained message(s); the captured epoch is stale`);
                     finishHeld(head);
                     continue;
+                }
+                const state = acceptanceState();
+                if (state === 'shutting_down') {
+                    warn(`peers: discarded ${head.envelopes.length} retained message(s); the binding is shutting down`);
+                    finishHeld(head);
+                    continue;
+                }
+                if (state !== 'accepting') {
+                    // A pending transition may still cancel or roll back: retain the
+                    // batch and retry. Only a stale committed epoch or shutdown drops
+                    // acknowledged retained work (plan section 6.2).
+                    break;
                 }
                 if (!head.force) {
                     if (head.queue.batches[0] !== head)
                         break;
                     if (!canSubmitNow())
                         break;
-                }
-                if (staleEpoch(head.envelopes[0].epoch)) {
-                    warn(`peers: discarded ${head.envelopes.length} retained message(s); the captured epoch is stale`);
-                    finishHeld(head);
-                    continue;
                 }
                 try {
                     await delivery.submitBatch(head.envelopes);

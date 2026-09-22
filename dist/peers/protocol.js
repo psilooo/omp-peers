@@ -100,6 +100,13 @@ const ALIAS_PATTERN = /^p-[0-9a-f]{22}$/;
 export function isValidPeerName(name) {
     return PEER_NAME_PATTERN.test(name) && RESERVED_NAMES[name] !== true && !ALIAS_PATTERN.test(name);
 }
+/**
+ * True for routable destination names: user-facing names plus the generated
+ * collision aliases, which stay reserved for name assignment but addressable.
+ */
+export function isRoutablePeerName(name) {
+    return PEER_NAME_PATTERN.test(name) && RESERVED_NAMES[name] !== true;
+}
 /** Trim, lowercase, strip control characters; empty string when unusable. */
 export function normalizeNameInput(raw) {
     const cleaned = raw.replace(/[\p{Cc}]/gu, '').toLowerCase().trim();

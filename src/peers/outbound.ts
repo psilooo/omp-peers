@@ -34,7 +34,7 @@ import {
   isCanonicalId,
   isRetryableRefusal,
   isSuccessCode,
-  isValidPeerName,
+  isRoutablePeerName,
   normalizeNameInput,
   parseChallenge,
   parseReply,
@@ -273,7 +273,7 @@ export async function resolveTarget(deps: OutboundDeps, to: string): Promise<Res
   const known = [
     ...new Set(routable.filter((record) => !identityEquals(record, self)).map((record) => record.name)),
   ].sort();
-  if (name === '' || !PEER_NAME_PATTERN.test(name) || !isValidPeerName(name)) {
+  if (name === '' || !PEER_NAME_PATTERN.test(name) || !isRoutablePeerName(name)) {
     return { kind: 'missing', known };
   }
   const matches = routable.filter((record) => record.name === name);
@@ -695,6 +695,8 @@ interface OperationOptions {
   budgetDeadline?: number;
   /** Receives the reserved slot's reply promise at reserve time. */
   onReserved?: (promise: Promise<string>) => void;
+  /** Per-attempt hop against the actually resolved record, retargets included. */
+  hopFor?: (record: PeerRecordV2) => number;
 }
 
 /**
@@ -739,10 +741,28 @@ async function performOperation(
   }
   const id = opts.pendingId ?? generateId();
   for (let tries = 0; ; tries += 1) {
+    let active = payload;
+    if (opts.hopFor !== undefined && payload.type === 'msg') {
+      const hop = opts.hopFor(record);
+      const target = identityOf(record);
+      if (!Number.isSafeInteger(hop) || hop < 0) {
+        return { code: 'invalid_request', detail: 'invalid hop', written: false, authenticated: false, target };
+      }
+      if (hop > MAX_HOP) {
+        return {
+          code: 'invalid_request',
+          detail: `relay chain is ${hop} hops from a human prompt; the limit is ${MAX_HOP}`,
+          written: false,
+          authenticated: false,
+          target,
+        };
+      }
+      active = { ...payload, hop };
+    }
     const report = await attemptExchange(
       deps,
       record,
-      payload,
+      active,
       id,
       deadline,
       opts.pendingId,
@@ -772,7 +792,7 @@ async function performOperation(
 function validateAddress(to: string): { name: string } | OutboundResult {
   const name = normalizeNameInput(to ?? '');
   if (name === '' || !PEER_NAME_PATTERN.test(name)) return { code: 'invalid_request', detail: 'invalid name' };
-  if (!isValidPeerName(name)) return { code: 'invalid_request', detail: 'reserved name' };
+  if (!isRoutablePeerName(name)) return { code: 'invalid_request', detail: 'reserved name' };
   return { name };
 }
 
@@ -799,7 +819,7 @@ export async function sendMsg(
   deps: OutboundDeps,
   to: string,
   body: string,
-  opts: { replyTo?: string; hop?: number } = {}
+  opts: { replyTo?: string; hop?: number; hopFor?: (record: PeerRecordV2) => number } = {}
 ): Promise<OutboundResult> {
   try {
     const state = acceptanceState(deps);
@@ -809,7 +829,7 @@ export async function sendMsg(
     const bodyError = validateBody(body);
     if (bodyError !== undefined) return bodyError;
     const hop = opts.hop ?? 0;
-    if (!Number.isInteger(hop) || hop < 0 || hop > MAX_HOP) {
+    if (opts.hopFor === undefined && (!Number.isInteger(hop) || hop < 0 || hop > MAX_HOP)) {
       return { code: 'invalid_request', detail: 'invalid hop' };
     }
     if (opts.replyTo !== undefined && !isCanonicalId(opts.replyTo)) {
@@ -817,7 +837,9 @@ export async function sendMsg(
     }
     const payload: MsgPayload =
       opts.replyTo !== undefined ? { type: 'msg', body, hop, replyTo: opts.replyTo } : { type: 'msg', body, hop };
-    const report = await performOperation(deps, address.name, payload, exchangeDeadline());
+    const report = await performOperation(deps, address.name, payload, exchangeDeadline(), {
+      ...(opts.hopFor !== undefined ? { hopFor: opts.hopFor } : {}),
+    });
     const afterState = acceptanceState(deps);
     if (afterState !== 'accepting') return { code: afterState };
     return reportResult(report);
@@ -830,7 +852,7 @@ export async function requestMsg(
   deps: OutboundDeps,
   to: string,
   body: string,
-  opts: { timeoutMs?: number; hop?: number } = {}
+  opts: { timeoutMs?: number; hop?: number; hopFor?: (record: PeerRecordV2) => number } = {}
 ): Promise<OutboundResult> {
   const requested = opts.timeoutMs;
   let timeoutMs = REQUEST_TIMEOUT_DEFAULT_MS;
@@ -849,15 +871,16 @@ export async function requestMsg(
     const bodyError = validateBody(body);
     if (bodyError !== undefined) return bodyError;
     const hop = opts.hop ?? 0;
-    if (!Number.isSafeInteger(hop) || hop < 0) {
+    if (opts.hopFor === undefined && (!Number.isSafeInteger(hop) || hop < 0)) {
       return { code: 'invalid_request', detail: 'invalid hop' };
     }
-    if (hop > MAX_HOP) {
+    if (opts.hopFor === undefined && hop > MAX_HOP) {
       return { code: 'invalid_request', detail: `hop ${hop} exceeds limit ${MAX_HOP}` };
     }
     const payload: MsgPayload = { type: 'msg', body, hop };
     report = await performOperation(deps, address.name, payload, deadline, {
       pendingId: id,
+      ...(opts.hopFor !== undefined ? { hopFor: opts.hopFor } : {}),
       onReserved: (promise) => {
         replyPromise = promise;
       },
