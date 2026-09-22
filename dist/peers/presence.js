@@ -71,20 +71,34 @@ async function unlinkQuiet(path) {
     }
 }
 const READ_RETRY_DELAY_MS = 50;
+const SCAN_RETRY_BUDGET = 3;
 /**
  * One bounded reread for transient torn reads: records are overwritten in
  * place, so a concurrent heartbeat can expose a partial body. A second
  * unusable read stays unusable; byte, ownership, identity, and freshness
  * checks are all preserved by the callers.
  */
-async function readParsedRecord(path) {
+async function readParsedRecord(path, allowRetry) {
     let parsed;
     for (let attempt = 0; attempt < 2; attempt += 1) {
         const raw = await readJsonBounded(path, RECORD_MAX_BYTES);
         parsed = raw === undefined ? undefined : parseRecord(raw);
         if (parsed !== undefined && parsed.kind !== 'malformed')
             return parsed;
-        if (attempt === 0) {
+        // Oversize bodies fail deterministically; a torn parse or a transient
+        // read failure is worth exactly one reread when the budget allows.
+        if (raw === undefined) {
+            let size = -1;
+            try {
+                size = (await lstat(path)).size;
+            }
+            catch {
+                size = -1;
+            }
+            if (size > RECORD_MAX_BYTES)
+                return parsed;
+        }
+        if (attempt === 0 && allowRetry) {
             await delayMs(READ_RETRY_DELAY_MS);
         }
     }
@@ -104,7 +118,7 @@ function parseEntryName(name) {
     return undefined;
 }
 /** Apply every scan acceptance and retention rule to one directory entry. */
-async function classifyEntry(roots, self, now, name) {
+async function classifyEntry(roots, self, now, name, takeRetry) {
     const id = parseEntryName(name);
     if (id === undefined) {
         return undefined;
@@ -114,7 +128,7 @@ async function classifyEntry(roots, self, now, name) {
     const isSelf = id.instance !== null && id.pid === self.pid && id.instance === self.instance;
     const liveness = isSelf ? 'alive' : probePid(id.pid);
     const readable = await recordFileOk(recordPath);
-    const parsed = readable ? await readParsedRecord(recordPath) : undefined;
+    const parsed = readable ? await readParsedRecord(recordPath, takeRetry()) : undefined;
     if (liveness === 'dead') {
         // Never delete a future version, and never delete what cannot be read:
         // either could belong to a newer plugin.
@@ -179,6 +193,10 @@ export async function scanPeers(roots, self, now = Date.now()) {
         return { routable, incompatible };
     }
     let seen = 0;
+    // Retained malformed records are ignored-but-kept by design; without a
+    // scan-wide cap their torn-read retries would serialize into the status
+    // and send deadlines. At most three entries per scan buy a reread.
+    let scanRetries = SCAN_RETRY_BUDGET;
     try {
         for await (const entry of handle) {
             if (seen >= MAX_DIR_ENTRIES) {
@@ -186,7 +204,10 @@ export async function scanPeers(roots, self, now = Date.now()) {
             }
             seen += 1;
             try {
-                const outcome = await classifyEntry(roots, self, now, entry.name);
+                const outcome = await classifyEntry(roots, self, now, entry.name, () => {
+                    scanRetries -= 1;
+                    return scanRetries >= 0;
+                });
                 if (outcome === undefined) {
                     continue;
                 }
@@ -223,7 +244,7 @@ export async function readPeerRecord(roots, pid, instance, now = Date.now()) {
     if (!(await recordFileOk(path))) {
         return undefined;
     }
-    const parsed = await readParsedRecord(path);
+    const parsed = await readParsedRecord(path, true);
     if (parsed === undefined || parsed.kind !== 'v2') {
         return undefined;
     }
