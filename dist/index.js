@@ -9,6 +9,8 @@ export { durableWriteJson, readJsonBounded } from './store/atomic.js';
 export { ensureStateRoots, peerEndpoint, peerRecordPath, rootHash, validateUnixEndpoint } from './store/paths.js';
 // Peer identity.
 export { hasDuplicateRoutableNames, newIdentity, projectFor, resolveName } from './peers/ids.js';
+// Codebase scope.
+export { resolveWorkspaceScope, scopeId } from './peers/scope.js';
 // Presence.
 export { formatBeatAge, readPeerRecord, removeOwnRecord, scanPeers, writeOwnRecord } from './peers/presence.js';
 // Host seam.

@@ -1,6 +1,6 @@
 # omp-peers
 
-Cross-session peer awareness for Oh My Pi (OMP). Every top-level OMP session on one machine, running as the same local OS user, can see and message every other by explicit name. No broker process, no cross-machine transport.
+Cross-session peer awareness for Oh My Pi (OMP). Every top-level OMP session working in the same codebase on one machine, running as the same local OS user, can see and message every other by explicit name. Sessions in other codebases are invisible and unreachable. No broker process, no cross-machine transport.
 
 ```text
 /peers                   list live peers by name
@@ -9,6 +9,17 @@ peer_request to="qa"     sends a message and waits for the reply
 ```
 
 Peers are other top-level OMP sessions, not subagents. Two sessions in the same repository working on different tasks is a supported and intended setup.
+
+## Codebase scope
+
+Visibility is per codebase:
+
+- Inside a git repository, the codebase is the repository's git common directory. Every subdirectory of the repository and every linked worktree (`git worktree add`) belongs to the same codebase, so all of their sessions see each other.
+- Outside any git repository, the codebase is the exact working directory. A parent or child directory is a different codebase.
+
+Sessions in other codebases are invisible and unreachable. They never appear in `/peers` or the `<peers>` roster note, and `peer_send`, `peer_request`, and `peer_status` answer `not_found` for their names. This is enforced by the storage layout, not by a display filter: each codebase has its own presence and socket directory (`peers/<scope id>/` under the state directory), a session only ever scans its own directory, and a receiver authenticates senders only against records in its own directory.
+
+The codebase is resolved from the session's working directory when the session arms. Sessions started before the upgrade to codebase scoping keep the old shared layout: they see only each other and cannot reach upgraded sessions. Restart them to join their codebase.
 
 ## Install
 
@@ -80,8 +91,9 @@ Inside the boundary:
 - Presence records carry only what routing needs: no session id, model, activity, or todos.
 - The automatic `<peers>` roster note contains only name, project, busy flag, and beat age, and is labeled untrusted peer status data.
 - Addressing is explicit only. There is no broadcast, no `to: "all"`.
+- Discovery and messaging are locked to one codebase (see [Codebase scope](#codebase-scope)). The scope separates cooperating sessions; it is not a defense against a same-user process, which can read and write every scope directory.
 
-State files are ephemeral; deleting the state directory is safe.
+State files are ephemeral; deleting the state directory is safe. Each codebase directory holds one `<pid>-<instance>.json` presence record and one `<16 hex>.sock` socket (a hash of the same pid and instance) per session, so a socket path is the state directory plus 45 bytes. The default `~/.omp/var/omp-peers/` fits the 103-byte macOS socket path limit for any ordinary home directory; an `OMP_PEERS_DIR` override longer than 58 bytes after symlinks resolve does not, and peers stay disabled rather than truncating the path.
 
 ## Upstream credit
 
@@ -91,7 +103,7 @@ This is a fork of [nikkoxgonzales/omp-peers](https://github.com/nikkoxgonzales/o
 
 | Command / tool | What it does |
 |---|---|
-| `/peers` | List live peers: name, project, busy/idle, beat age. Incompatible (v1/future) records shown but never dialed. |
+| `/peers` | List live peers in this codebase: name, project, busy/idle, beat age. Incompatible (v1/future) records shown but never dialed. |
 | `peer_send` (agent tool) | `to` (peer name), `message`, optional `replyTo`. Injects a real prompt into the named peer. |
 | `peer_status` (agent tool) | `to` (peer name). Authenticated pull of bounded status fields (busy, up to 20 todos, beat age). |
 | `peer_request` (agent tool) | `to`, `message`, `timeout_ms` (default 30 s, clamped 5 to 120 s). Waits for a matching reply from that peer. |

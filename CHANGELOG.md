@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Breaking changes:
+
+- Peer discovery and messaging are locked to one codebase. A session's codebase is the git common directory of its working directory, so every subdirectory and linked worktree of one repository shares it; outside git it is the exact working directory. Sessions in other codebases no longer appear in `/peers` or the roster note, and `peer_send`, `peer_request`, and `peer_status` answer `not_found` for them.
+- Presence records and sockets moved to a per-codebase directory, `peers/<scope id>/` under the state directory. A session scans only its own codebase directory and authenticates inbound senders only against it, so other codebases are unreachable by construction, not hidden by a filter. Flat records written directly in `peers/` by older versions are ignored.
+- Records keep their `<pid>-<instance>.json` names, but each socket is now `<16 hex>.sock`, a hash of the session's pid and instance, so the full socket path stays within the 103-byte macOS limit under the default state directory even for long usernames.
+- Sessions started before the upgrade keep the old layout and see only each other; restart them to join their codebase.
+
 ## 2.0.0
 
 First release of the psilooo fork of nikkoxgonzales/omp-peers.

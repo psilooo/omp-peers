@@ -239,9 +239,10 @@ function takeBackgroundErrors() {
   return backgroundErrors.splice(0, backgroundErrors.length);
 }
 
-// A short base keeps `<base>/peers/<pid>-<32 hex>.sock` under the 103-byte
-// macOS pathname ceiling; the default macOS TMPDIR under /var/folders can
-// overrun it. Windows named pipes have no pathname-length problem.
+// A short base keeps `<base>/peers/<16 hex scope>/<16 hex>.sock` under the
+// 103-byte macOS pathname ceiling; the default macOS TMPDIR under
+// /var/folders can overrun it. Windows named pipes have no pathname-length
+// problem.
 const STATE_BASE = process.platform === 'win32' ? tmpdir() : '/tmp';
 
 async function makeStateDir() {

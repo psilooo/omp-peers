@@ -6,8 +6,11 @@
  * notifications, and an emit() driver. startChild/startPair spawn real OS
  * processes running the built dist/extension.js behind the scripted fake
  * host in child-runner.mjs, driven over stdio JSON lines, so tests exercise
- * real Unix sockets end to end. macOS is the only target platform; win32 is
- * unsupported and fails closed.
+ * real Unix sockets end to end. Each child runs in its own working directory
+ * (options.cwd, default this process's cwd), so its records and socket live
+ * in the codebase scope directory `<peerDir>/peers/<scopeId>/` derived from
+ * that cwd; children in different codebases cannot see each other. macOS is
+ * the only target platform; win32 is unsupported and fails closed.
  */
 
 import { spawn } from 'node:child_process';
@@ -16,6 +19,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
+import { resolveWorkspaceScope, scopeId } from '../../dist/peers/scope.js';
+import { peerEndpoint } from '../../dist/store/paths.js';
 
 const FIXTURE_DIR = dirname(fileURLToPath(import.meta.url));
 const RUNNER = join(FIXTURE_DIR, 'child-runner.mjs');
@@ -24,9 +29,9 @@ const READY_TIMEOUT_MS = 15_000;
 const STOP_TIMEOUT_MS = 5_000;
 const POLL_MS = 25;
 const UNIX_ENDPOINT_CEILING = process.platform === 'darwin' ? 103 : 107;
-// A short base keeps `<base>/peers/<pid>-<32 hex>.sock` under the 103-byte
-// macOS pathname ceiling; the default macOS TMPDIR under /var/folders can
-// overrun it.
+// A short base keeps `<base>/peers/<16 hex scope>/<16 hex>.sock` under the
+// 103-byte macOS pathname ceiling; the default macOS TMPDIR under
+// /var/folders can overrun it.
 const STATE_BASE = '/tmp';
 const BASELINE_TOOLS = ['bash', 'read'];
 const SUPPORTED_VERSION = '18.2.6';
@@ -45,8 +50,8 @@ function errorMessage(err) {
 /**
  * In-process scripted host. Knobs: version (pi.pi.VERSION, present when the
  * key is passed), registerTool 'ok' | 'throw' | 'drop', sendUserMessage
- * presence, and a 'full' (top-level classifiable) or 'reduced' session
- * manager.
+ * presence, a 'full' (top-level classifiable) or 'reduced' session manager,
+ * and cwd (ctx.cwd, which selects the codebase scope; default process.cwd()).
  */
 export function createFakeHost(options = {}) {
   const registerMode = options.registerTool ?? 'ok';
@@ -93,7 +98,7 @@ export function createFakeHost(options = {}) {
   }
 
   const ctx = {
-    cwd: process.cwd(),
+    cwd: typeof options.cwd === 'string' && options.cwd !== '' ? options.cwd : process.cwd(),
     mode: 'interactive',
     ui: {
       notify: (message) => {
@@ -216,30 +221,45 @@ async function preparePeerDir(dir) {
   return false;
 }
 
-function assertEndpointFits(peerDir) {
+function assertEndpointFits(recordDir) {
   if (UNIX_ENDPOINT_CEILING === undefined) return;
-  const longest = join(peerDir, RECORD_DIR, `${'9'.repeat(10)}-${'f'.repeat(32)}.sock`);
-  if (longest.length > UNIX_ENDPOINT_CEILING) {
+  // Every endpoint name is a fixed-width `<16 hex>.sock`, whatever the pid.
+  const longest = join(recordDir, `${'f'.repeat(16)}.sock`);
+  const bytes = Buffer.byteLength(longest, 'utf8');
+  if (bytes > UNIX_ENDPOINT_CEILING) {
     throw new TypeError(
-      `peerDir leaves no room for a ${UNIX_ENDPOINT_CEILING}-byte unix socket path (${longest.length} bytes): ${longest}`,
+      `peerDir leaves no room for a ${UNIX_ENDPOINT_CEILING}-byte unix socket path (${bytes} bytes): ${longest}`,
     );
   }
 }
 
-/** Remove only this child's exact record and endpoint leftovers by pid prefix. */
-async function sweepPeerDir(peerDir, pid) {
-  for (const dir of [join(peerDir, RECORD_DIR), peerDir]) {
-    let entries;
-    try {
-      entries = await readdir(dir);
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      if (entry.startsWith(`${pid}-`) && (entry.endsWith('.json') || entry.endsWith('.sock'))) {
-        await rm(join(dir, entry), { force: true }).catch(() => undefined);
-      }
-    }
+const OWN_RECORD_NAME = /^([1-9]\d*)-([0-9a-f]{32})\.json$/;
+
+/**
+ * Remove only this child's exact leftovers: each `<pid>-<instance>.json`
+ * record it left and the endpoint derived from that same (pid, instance)
+ * through the plugin's own peerEndpoint.
+ */
+async function sweepRecordDir(recordDir, pid) {
+  let entries;
+  try {
+    entries = await readdir(recordDir);
+  } catch {
+    return;
+  }
+  const roots = { root: recordDir, peersDir: recordDir, scope: '' };
+  for (const entry of entries) {
+    const match = OWN_RECORD_NAME.exec(entry);
+    if (match === null || Number(match[1]) !== pid) continue;
+    await rm(join(recordDir, entry), { force: true }).catch(() => undefined);
+    await rm(peerEndpoint(roots, pid, match[2]), { force: true }).catch(() => undefined);
+  }
+}
+
+/** Remove a fixture-created peer dir bottom up, each level only when empty. */
+async function removeCreatedDirs(peerDir, recordDir) {
+  for (const dir of [recordDir, join(peerDir, RECORD_DIR), peerDir]) {
+    await rmdir(dir).catch(() => undefined);
   }
 }
 
@@ -253,6 +273,9 @@ async function removeDir(dir) {
  * record exists; stop() shuts the child down and sweeps its leftovers,
  * stopWithoutSweep() shuts down without sweeping so a test can observe the
  * plugin's own cleanup first, and the same cleanup runs when ready fails.
+ * options.cwd (absolute or resolved against this process's cwd) becomes the
+ * child's working directory and so its codebase scope; the handle exposes
+ * scopeKey and peersDir (the scoped record directory) for inspection.
  */
 export async function startChild(options) {
   assertSupportedPlatform();
@@ -260,12 +283,19 @@ export async function startChild(options) {
   if (typeof opts.peerDir !== 'string' || opts.peerDir === '') {
     throw new TypeError('startChild requires options.peerDir');
   }
+  if (opts.cwd !== undefined && (typeof opts.cwd !== 'string' || opts.cwd === '')) {
+    throw new TypeError('startChild options.cwd must be a non-empty string');
+  }
   const label = typeof opts.label === 'string' && opts.label !== '' ? opts.label : undefined;
   const peerDir = resolve(opts.peerDir);
-  assertEndpointFits(peerDir);
+  const cwd = opts.cwd === undefined ? process.cwd() : resolve(opts.cwd);
+  const scopeKey = await resolveWorkspaceScope(cwd);
+  const recordDir = join(peerDir, RECORD_DIR, scopeId(scopeKey));
+  assertEndpointFits(recordDir);
   const createdDir = await preparePeerDir(peerDir);
 
   const child = spawn(process.execPath, [RUNNER], {
+    cwd,
     env: {
       ...process.env,
       OMP_PEERS_DIR: peerDir,
@@ -410,8 +440,8 @@ export async function startChild(options) {
   }
 
   async function sweepOwnLeftovers() {
-    await sweepPeerDir(peerDir, child.pid);
-    if (createdDir) await rmdir(peerDir).catch(() => undefined);
+    await sweepRecordDir(recordDir, child.pid);
+    if (createdDir) await removeCreatedDirs(peerDir, recordDir);
   }
 
   // Shuts the child down without sweeping so a test can inspect the plugin's
@@ -427,22 +457,19 @@ export async function startChild(options) {
   }
 
   async function waitForRecord() {
-    const dirs = [join(peerDir, RECORD_DIR), peerDir];
     const deadline = Date.now() + READY_TIMEOUT_MS;
     for (;;) {
       if (exited) throw new Error(`child exited before writing a record; ${diag()}`);
-      for (const dir of dirs) {
-        let entries;
-        try {
-          entries = await readdir(dir);
-        } catch {
-          continue;
-        }
-        const hit = entries.find((entry) => entry.startsWith(`${child.pid}-`) && entry.endsWith('.json'));
-        if (hit !== undefined) return join(dir, hit);
+      let entries = [];
+      try {
+        entries = await readdir(recordDir);
+      } catch {
+        // The scope directory appears once the child arms.
       }
+      const hit = entries.find((entry) => entry.startsWith(`${child.pid}-`) && entry.endsWith('.json'));
+      if (hit !== undefined) return join(recordDir, hit);
       if (Date.now() >= deadline) {
-        throw new Error(`no presence record under ${peerDir} within ${READY_TIMEOUT_MS}ms; ${diag()}`);
+        throw new Error(`no presence record under ${recordDir} within ${READY_TIMEOUT_MS}ms; ${diag()}`);
       }
       await sleep(POLL_MS);
     }
@@ -460,14 +487,16 @@ export async function startChild(options) {
       killAndSweep();
       await waitForExit(STOP_TIMEOUT_MS);
       liveChildren.delete(child);
-      await sweepPeerDir(peerDir, child.pid);
-      if (createdDir) await rmdir(peerDir).catch(() => undefined);
+      await sweepRecordDir(recordDir, child.pid);
+      if (createdDir) await removeCreatedDirs(peerDir, recordDir);
       throw err;
     }
   })();
 
   handle = {
     pid: child.pid,
+    scopeKey,
+    peersDir: recordDir,
     recordPath: undefined,
     ready,
     invoke: (eventType, payload) => request({ cmd: 'emit', eventType, payload }),

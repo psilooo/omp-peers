@@ -1,14 +1,16 @@
 /**
  * Lifecycle behavior suite: presence/state roots/names, injection privacy,
  * factory origin and version gates, transcript transition fencing, paired
- * children over real unix sockets, and shutdown settlement. Runs against the
- * COMPILED package (dist) plus the two-child fixture only.
+ * children over real unix sockets, shutdown settlement, and codebase scope
+ * locking. Runs against the COMPILED package (dist) plus the two-child
+ * fixture only.
  */
 
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, readdir, readFile, rm, stat, symlink, writeFile, chmod } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readdir, readFile, realpath, rm, stat, symlink, writeFile, chmod } from 'node:fs/promises';
 import { createConnection, createServer } from 'node:net';
 import { join } from 'node:path';
 
@@ -45,10 +47,16 @@ const { ensureStateRoots, peerRecordPath, peerEndpoint, validateUnixEndpoint } =
 const { startPeerServer } = await import('../dist/peers/server.js');
 const { formatPeersText } = await import('../dist/commands/peers.js');
 const { classifySession } = await import('../dist/peers/session-kind.js');
+const { resolveWorkspaceScope, scopeId } = await import('../dist/peers/scope.js');
 const { createFakeHost, startChild, startPair } = await import('./fixture/two-child.mjs');
 
-const ROOT_TMP = join('/tmp', `peers-life-${process.pid}`);
-await mkdir(ROOT_TMP, { recursive: true, mode: 0o700 });
+// A short mkdtemp base keeps `<root>/<label>/peers/<16 hex scope>/<16
+// hex>.sock` well under the 103-byte macOS sun_path ceiling once /tmp
+// resolves to /private/tmp.
+const ROOT_TMP = await mkdtemp(join('/tmp', 'pl-'));
+// In-process fake hosts report process.cwd() as ctx.cwd, and fixture children
+// inherit it, so every binding in this suite arms in this codebase scope.
+const HOST_SCOPE = await resolveWorkspaceScope(process.cwd());
 const ORIG_PEERS_DIR = process.env.OMP_PEERS_DIR;
 
 after(async () => {
@@ -79,7 +87,12 @@ function usePeersDir(dir) {
 }
 
 async function makeRoots(label) {
-  return ensureStateRoots({ OMP_PEERS_DIR: join(ROOT_TMP, label) });
+  return ensureStateRoots(HOST_SCOPE, { OMP_PEERS_DIR: join(ROOT_TMP, label) });
+}
+
+/** The scoped record directory a binding armed under state root `dir` writes to. */
+function scopedPeersDir(dir) {
+  return join(dir, 'peers', scopeId(HOST_SCOPE));
 }
 
 function captureCommands(fake) {
@@ -348,12 +361,12 @@ describe('presence records, state roots, and liveness', () => {
 
       await fake.emit('session_start', { reason: 'startup' });
       assert.equal(
-        existsSync(peerRecordPath(await ensureStateRoots({ OMP_PEERS_DIR: dir }), process.pid, 'f'.repeat(32))),
+        existsSync(peerRecordPath(await ensureStateRoots(HOST_SCOPE, { OMP_PEERS_DIR: dir }), process.pid, 'f'.repeat(32))),
         false,
         'the record appears only after the arm sequence, not when session_start resolves'
       );
 
-      const peersDir = join(dir, 'peers');
+      const peersDir = scopedPeersDir(dir);
       let recordPath;
       await waitFor(
         () => {
@@ -398,7 +411,7 @@ describe('presence records, state roots, and liveness', () => {
 
       const parsed = parseRecord(await readFile(recordPath, 'utf8'));
       assert.equal(parsed.kind, 'v2');
-      const roots = await ensureStateRoots({ OMP_PEERS_DIR: dir });
+      const roots = await ensureStateRoots(HOST_SCOPE, { OMP_PEERS_DIR: dir });
       const reread = await readPeerRecord(roots, process.pid, rec.instance);
       assert.ok(reread, 'the record reads back under scan acceptance rules');
 
@@ -441,7 +454,7 @@ describe('presence records, state roots, and liveness', () => {
     } finally {
       await fake.emit('session_shutdown', undefined);
       restore();
-      const roots = await ensureStateRoots({ OMP_PEERS_DIR: dir });
+      const roots = await ensureStateRoots(HOST_SCOPE, { OMP_PEERS_DIR: dir });
       const probe = { pid: process.pid, instance: 'e'.repeat(32) };
       await waitFor(
         () => !existsSync(peerRecordPath(roots, process.pid, readSyncInstance(dir))) && !existsSync(peerEndpoint(roots, probe.pid, readSyncInstance(dir))),
@@ -453,7 +466,7 @@ describe('presence records, state roots, and liveness', () => {
 
   it('refuses unsafe OMP_PEERS_DIR overrides through ensureStateRoots', async () => {
     await assert.rejects(
-      () => ensureStateRoots({ OMP_PEERS_DIR: join('relative', 'peers-dir') }),
+      () => ensureStateRoots(HOST_SCOPE, { OMP_PEERS_DIR: join('relative', 'peers-dir') }),
       /must be an absolute path/,
       'a relative override is refused'
     );
@@ -463,7 +476,7 @@ describe('presence records, state roots, and liveness', () => {
     const link = join(ROOT_TMP, 'sym-link');
     await symlink(real, link);
     await assert.rejects(
-      () => ensureStateRoots({ OMP_PEERS_DIR: link }),
+      () => ensureStateRoots(HOST_SCOPE, { OMP_PEERS_DIR: link }),
       /must be a real directory/,
       'a symlinked root is refused'
     );
@@ -471,7 +484,7 @@ describe('presence records, state roots, and liveness', () => {
     const ownerProbe = await stat('/private/etc');
     assert.notEqual(ownerProbe.uid, process.getuid(), 'precondition: /private/etc belongs to another user');
     await assert.rejects(
-      () => ensureStateRoots({ OMP_PEERS_DIR: '/private/etc' }),
+      () => ensureStateRoots(HOST_SCOPE, { OMP_PEERS_DIR: '/private/etc' }),
       /owned by the current user/,
       'a wrong-owner root is refused'
     );
@@ -480,10 +493,39 @@ describe('presence records, state roots, and liveness', () => {
     await mkdir(wrongMode, { recursive: true, mode: 0o700 });
     await chmod(wrongMode, 0o755);
     await assert.rejects(
-      () => ensureStateRoots({ OMP_PEERS_DIR: wrongMode }),
+      () => ensureStateRoots(HOST_SCOPE, { OMP_PEERS_DIR: wrongMode }),
       /group\/other permission bits/,
       'a wrong-mode root is refused, never chmodded'
     );
+  });
+
+  it('creates one 0700 directory per codebase scope and refuses a relative scope key', async () => {
+    const refusedDir = join(ROOT_TMP, 'scope-rel');
+    await assert.rejects(
+      () => ensureStateRoots(join('relative', 'repo', '.git'), { OMP_PEERS_DIR: refusedDir }),
+      /scope key must be an absolute path/,
+      'a relative scope key is refused'
+    );
+    assert.ok(!existsSync(refusedDir), 'a refused scope key creates no state');
+
+    const dir = join(ROOT_TMP, 'scope-mk');
+    const keyA = join(ROOT_TMP, 'code-a', '.git');
+    const keyB = join(ROOT_TMP, 'code-b');
+    const rootsA = await ensureStateRoots(keyA, { OMP_PEERS_DIR: dir });
+    const rootsB = await ensureStateRoots(keyB, { OMP_PEERS_DIR: dir });
+    const canonical = await realpath(dir);
+    assert.match(rootsA.scope, /^[0-9a-f]{16}$/, 'the scope id is 16 lowercase hex characters');
+    assert.equal(rootsA.scope, scopeId(keyA));
+    assert.equal(rootsA.peersDir, join(canonical, 'peers', rootsA.scope), 'records live under peers/<scope>');
+    assert.equal(rootsB.root, rootsA.root, 'both scopes share one state root');
+    assert.notEqual(rootsB.peersDir, rootsA.peersDir, 'distinct scope keys get distinct record directories');
+    for (const created of [join(canonical, 'peers'), rootsA.peersDir, rootsB.peersDir]) {
+      const info = await stat(created);
+      assert.ok(info.isDirectory(), `${created} is a directory`);
+      assert.equal(info.mode & 0o777, 0o700, `${created} is created 0700`);
+    }
+    const again = await ensureStateRoots(keyA, { OMP_PEERS_DIR: dir });
+    assert.equal(again.peersDir, rootsA.peersDir, 'the same scope key maps to the same directory');
   });
 
   it('refuses an endpoint over the 103-byte ceiling with no record written', async () => {
@@ -503,9 +545,11 @@ describe('presence records, state roots, and liveness', () => {
       });
       const notice = fake.calls.notifies.join('\n');
       assert.ok(notice.includes('103'), 'the refusal names the sun_path ceiling');
-      const deepPeers = join(deepDir, 'peers');
+      const deepPeers = scopedPeersDir(deepDir);
       assert.deepEqual(await readdir(deepPeers), [], 'an over-ceiling endpoint leaves no record behind');
-      assert.ok(!existsSync(peerRecordPath({ root: deepDir, peersDir: deepPeers }, process.pid, 'c'.repeat(32))));
+      assert.ok(
+        !existsSync(peerRecordPath({ root: deepDir, peersDir: deepPeers, scope: scopeId(HOST_SCOPE) }, process.pid, 'c'.repeat(32)))
+      );
     } finally {
       restore();
       await rm(join(ROOT_TMP, 'deep'), { recursive: true, force: true });
@@ -1029,49 +1073,53 @@ describe('rendered notes and pure transforms', () => {
   });
 });
 
-describe('transcript transition fencing', () => {
-  async function armFactory(label) {
-    const dir = join(ROOT_TMP, label);
-    const restore = usePeersDir(dir);
-    const fake = createFakeHost();
-    const commands = captureCommands(fake);
-    const tools = captureTools(fake);
-    extension(fake.host);
-    await fake.emit('session_start', { reason: 'startup' });
-    const peersDir = join(dir, 'peers');
-    let recordPath;
+/**
+ * Arm one in-process fake host under `<ROOT_TMP>/<label>` in the host scope,
+ * with a 'probe' sender record published beside it.
+ */
+async function armFactory(label) {
+  const dir = join(ROOT_TMP, label);
+  const restore = usePeersDir(dir);
+  const fake = createFakeHost();
+  const commands = captureCommands(fake);
+  const tools = captureTools(fake);
+  extension(fake.host);
+  await fake.emit('session_start', { reason: 'startup' });
+  const peersDir = scopedPeersDir(dir);
+  let recordPath;
+  await waitFor(
+    () => {
+      let entries;
+      try {
+        entries = require$readdirSync(peersDir);
+      } catch {
+        return false;
+      }
+      const hit = entries.find((entry) => entry.startsWith(`${process.pid}-`) && entry.endsWith('.json'));
+      if (hit === undefined) return false;
+      recordPath = join(peersDir, hit);
+      return true;
+    },
+    { label: `${label} record` }
+  );
+  const roots = await ensureStateRoots(HOST_SCOPE, { OMP_PEERS_DIR: dir });
+  const record = JSON.parse(await readFile(recordPath, 'utf8'));
+  const self = { pid: record.pid, instance: record.instance, token: record.token };
+  const probe = makeIdentity(process.pid);
+  await putRecord(roots, probe, { name: 'probe' });
+  const teardown = async () => {
+    await fake.emit('session_shutdown', undefined);
+    restore();
     await waitFor(
-      () => {
-        let entries;
-        try {
-          entries = require$readdirSync(peersDir);
-        } catch {
-          return false;
-        }
-        const hit = entries.find((entry) => entry.startsWith(`${process.pid}-`) && entry.endsWith('.json'));
-        if (hit === undefined) return false;
-        recordPath = join(peersDir, hit);
-        return true;
-      },
-      { label: `${label} record` }
-    );
-    const roots = await ensureStateRoots({ OMP_PEERS_DIR: dir });
-    const record = JSON.parse(await readFile(recordPath, 'utf8'));
-    const self = { pid: record.pid, instance: record.instance, token: record.token };
-    const probe = makeIdentity(process.pid);
-    await putRecord(roots, probe, { name: 'probe' });
-    const teardown = async () => {
-      await fake.emit('session_shutdown', undefined);
-      restore();
-      await waitFor(
-        () => !existsSync(recordPath) && !existsSync(peerEndpoint(roots, self.pid, self.instance)),
-        { label: `${label} shutdown cleanup` }
-      ).catch(() => undefined);
-      await rm(dir, { recursive: true, force: true });
-    };
-    return { dir, peersDir, roots, fake, commands, tools, recordPath, record, self, probe, teardown };
-  }
+      () => !existsSync(recordPath) && !existsSync(peerEndpoint(roots, self.pid, self.instance)),
+      { label: `${label} shutdown cleanup` }
+    ).catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  };
+  return { dir, peersDir, roots, fake, commands, tools, recordPath, record, self, probe, teardown };
+}
 
+describe('transcript transition fencing', () => {
   it('settles an in-flight socket once with session_transition and commits without rotating', { timeout: 30000 }, async () => {
     const fx = await armFactory('fence');
     try {
@@ -1325,12 +1373,12 @@ describe('paired children and captured attribution over real sockets', () => {
       extension(fakeB.host);
       await fakeA.emit('session_start', { reason: 'startup' });
       await fakeB.emit('session_start', { reason: 'startup' });
-      const peersDir = join(dir, 'peers');
+      const peersDir = scopedPeersDir(dir);
       await waitFor(
         () => existsSync(peersDir) && require$readdirSync(peersDir).filter((entry) => entry.endsWith('.json')).length === 2,
         { label: 'both in-process records' }
       );
-      const roots = await ensureStateRoots({ OMP_PEERS_DIR: dir });
+      const roots = await ensureStateRoots(HOST_SCOPE, { OMP_PEERS_DIR: dir });
       const entries = require$readdirSync(peersDir).filter((entry) => entry.endsWith('.json'));
       const recordNames = new Set();
       for (const entry of entries) {
@@ -1394,7 +1442,7 @@ describe('child shutdown settlement', () => {
     let raw;
     try {
       await child.ready;
-      const roots = await ensureStateRoots({ OMP_PEERS_DIR: peerDir });
+      const roots = await ensureStateRoots(child.scopeKey, { OMP_PEERS_DIR: peerDir });
       const parsed = parseRecord(await readFile(child.recordPath, 'utf8'));
       assert.equal(parsed.kind, 'v2');
       const self = { pid: parsed.record.pid, instance: parsed.record.instance, token: parsed.record.token };
@@ -1419,7 +1467,7 @@ describe('child shutdown settlement', () => {
       await sleep(600);
       assert.equal(replyCount(raw), 1, 'shutdown settles the socket exactly once');
 
-      const peersDir = join(peerDir, 'peers');
+      const peersDir = child.peersDir;
       const entries = await readdir(peersDir);
       assert.ok(
         !entries.some((entry) => entry.startsWith(`${child.pid}-`)),
@@ -1437,6 +1485,266 @@ describe('child shutdown settlement', () => {
       if (raw !== undefined) raw.close();
       await child.stop().catch(() => undefined);
       await rm(peerDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('codebase scope locking', () => {
+  it('keys a plain directory by itself and every repo subdirectory and worktree by the git common dir', async () => {
+    const base = join(ROOT_TMP, 'ws');
+    const plain = join(base, 'plain');
+    const plainSub = join(plain, 'sub');
+    const repo = join(base, 'repo');
+    const repoDeep = join(repo, 'src', 'deep');
+    const worktrees = join(repo, '.git', 'worktrees');
+    const wtAbs = join(base, 'wt-abs');
+    const wtRel = join(base, 'wt-rel');
+    for (const dir of [plainSub, repoDeep, join(worktrees, 'wt-abs'), join(worktrees, 'wt-rel'), join(wtAbs, 'pkg'), wtRel]) {
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+    }
+    // A linked worktree: `.git` is a file naming its private git dir, whose
+    // `commondir` points back at the shared repository git dir.
+    await writeFile(join(worktrees, 'wt-abs', 'commondir'), '../..\n');
+    await writeFile(join(worktrees, 'wt-rel', 'commondir'), '../..\n');
+    await writeFile(join(wtAbs, '.git'), `gitdir: ${join(await realpath(worktrees), 'wt-abs')}\n`);
+    await writeFile(join(wtRel, '.git'), 'gitdir: ../repo/.git/worktrees/wt-rel\n');
+
+    try {
+      assert.equal(await resolveWorkspaceScope(plain), await realpath(plain), 'a non-git directory keys by its realpath');
+      assert.equal(
+        await resolveWorkspaceScope(plainSub),
+        await realpath(plainSub),
+        'a non-git subdirectory keys by itself, never widening to its parent'
+      );
+      const common = await realpath(join(repo, '.git'));
+      assert.equal(await resolveWorkspaceScope(repo), common, 'the repo root keys by its git dir');
+      assert.equal(await resolveWorkspaceScope(repoDeep), common, 'a repo subdirectory shares the repo scope');
+      assert.equal(await resolveWorkspaceScope(join(wtAbs, 'pkg')), common, 'a linked worktree shares the repo scope');
+      assert.equal(
+        await resolveWorkspaceScope(wtRel),
+        common,
+        'a relative gitdir pointer resolves against the worktree, not the process cwd'
+      );
+      const missing = join(base, 'missing');
+      assert.equal(await resolveWorkspaceScope(missing), missing, 'an unresolvable cwd falls back to itself without throwing');
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('hides and refuses peers in other codebases while subdirectories of one repo stay connected', { timeout: 60000 }, async () => {
+    const peerDir = join('/tmp', `opl-sc-${process.pid}`);
+    await rm(peerDir, { recursive: true, force: true });
+    const base = join(ROOT_TMP, 'sc');
+    const repo = join(base, 'repo');
+    const other = join(base, 'other');
+    for (const dir of [join(repo, '.git'), join(repo, 'a'), join(repo, 'b'), other]) {
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+    }
+    const children = [];
+    const intruder = makeIdentity(process.pid);
+    const intruderRecords = [];
+    try {
+      const alpha = await startChild({ peerDir, label: 'alpha', cwd: join(repo, 'a') });
+      children.push(alpha);
+      const beta = await startChild({ peerDir, label: 'beta', cwd: join(repo, 'b') });
+      children.push(beta);
+      const gamma = await startChild({ peerDir, label: 'gamma', cwd: other });
+      children.push(gamma);
+      await Promise.all(children.map((child) => child.ready));
+
+      const recordOf = async (child) => {
+        const parsed = parseRecord(await readFile(child.recordPath, 'utf8'));
+        assert.equal(parsed.kind, 'v2');
+        return parsed.record;
+      };
+      const [alphaRec, betaRec, gammaRec] = await Promise.all(children.map(recordOf));
+      assert.equal(alpha.peersDir, beta.peersDir, 'two subdirectories of one repo publish into one scope directory');
+      assert.notEqual(gamma.peersDir, alpha.peersDir, 'another codebase publishes into its own scope directory');
+
+      const repoRoots = await ensureStateRoots(alpha.scopeKey, { OMP_PEERS_DIR: peerDir });
+      const otherRoots = await ensureStateRoots(gamma.scopeKey, { OMP_PEERS_DIR: peerDir });
+      const observer = { pid: process.pid, instance: generateInstance() };
+      const namesIn = async (roots) => (await scanPeers(roots, observer)).routable.map((row) => row.name).sort();
+      assert.deepEqual(await namesIn(repoRoots), [alphaRec.name, betaRec.name].sort(), 'the repo scope lists only its own sessions');
+      assert.deepEqual(await namesIn(otherRoots), [gammaRec.name], 'the other codebase sees only itself');
+
+      let statusReceipt;
+      await waitFor(
+        async () => {
+          try {
+            statusReceipt = await Promise.race([alpha.tool('peer_status', { to: betaRec.name }), sleep(4000)]);
+            return typeof statusReceipt === 'string' && statusReceipt.includes(`\`${betaRec.name}\`: status`);
+          } catch {
+            return false;
+          }
+        },
+        { timeout: 20000, interval: 250, label: 'same-scope status over a real socket' }
+      );
+
+      const crossSend = await gamma.tool('peer_send', { to: alphaRec.name, message: 'cross-codebase hello' });
+      assert.ok(crossSend.includes(`\`${alphaRec.name}\`: not_found`), `a send across codebases is not_found, got: ${crossSend}`);
+      const crossStatus = await alpha.tool('peer_status', { to: gammaRec.name });
+      assert.ok(
+        crossStatus.includes(`\`${gammaRec.name}\`: not_found`),
+        `a status pull across codebases is not_found, got: ${crossStatus}`
+      );
+
+      // Dialing the endpoint directly does not help: the receiver authenticates
+      // senders only from records in its own scope directory.
+      const alphaSelf = { pid: alphaRec.pid, instance: alphaRec.instance, token: alphaRec.token };
+      const endpoint = peerEndpoint(repoRoots, alphaSelf.pid, alphaSelf.instance);
+      const ping = async () => {
+        const raw = openRaw(endpoint);
+        try {
+          await raw.connect();
+          const hs = await verifiedHandshake(raw, alphaSelf);
+          raw.send(requestFrame({ ...hs, sender: intruder, receiver: alphaSelf, payload: { type: 'ping' } }));
+          return terminalCode(await raw.nextLine());
+        } finally {
+          raw.close();
+        }
+      };
+      await putRecord(otherRoots, intruder, { name: 'intruder' });
+      intruderRecords.push(otherRoots);
+      assert.equal(await ping(), 'unauthenticated', 'a sender published only in another codebase is refused');
+      await putRecord(repoRoots, intruder, { name: 'intruder' });
+      intruderRecords.push(repoRoots);
+      assert.equal(await ping(), 'pong', 'the same sender published in the receiver scope is accepted');
+    } finally {
+      for (const roots of intruderRecords) {
+        await removeOwnRecord(roots, process.pid, intruder.instance).catch(() => undefined);
+      }
+      for (const child of children) await child.stop().catch(() => undefined);
+      await rm(peerDir, { recursive: true, force: true });
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Park every libuv threadpool worker in a blocking FIFO open so no fs promise
+ * (scope resolve, scan, record write, auth read) settles until the returned
+ * release() runs; sockets, timers, and synchronous host callbacks keep going.
+ */
+async function holdThreadpool(label) {
+  const size = Number.parseInt(process.env.UV_THREADPOOL_SIZE ?? '', 10) || 4;
+  const dir = join(ROOT_TMP, `${label}-fifo`);
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const fifos = Array.from({ length: size }, (_, index) => join(dir, `f${index}`));
+  for (const fifo of fifos) execFileSync('mkfifo', [fifo]);
+  const readers = fifos.map((fifo) => open(fifo, 'r'));
+  await sleep(50);
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    const writers = [];
+    for (const fifo of fifos) {
+      for (;;) {
+        try {
+          writers.push(nodeFs.openSync(fifo, nodeFs.constants.O_WRONLY | nodeFs.constants.O_NONBLOCK));
+          break;
+        } catch (err) {
+          if (err?.code !== 'ENXIO') throw err;
+          await sleep(5);
+        }
+      }
+    }
+    // Writers stay open until every reader returned: a BSD FIFO reader
+    // re-sleeps when the only writer is already gone at wakeup.
+    const handles = await Promise.all(readers);
+    for (const fd of writers) nodeFs.closeSync(fd);
+    for (const handle of handles) await handle.close();
+  };
+}
+
+function hasOwnRecord(peersDir) {
+  try {
+    return require$readdirSync(peersDir).some((entry) => entry.startsWith(`${process.pid}-`) && entry.endsWith('.json'));
+  } catch {
+    return false;
+  }
+}
+
+describe('codebase rescope fencing', () => {
+  it('fences the old scope as soon as the cwd moves, re-arms in the new scope, and lifts the fence for the same scope', { timeout: 30000 }, async () => {
+    const fx = await armFactory('mv');
+    const repo = join(ROOT_TMP, 'mv-repo');
+    for (const sub of ['.git', 'a', 'b']) await mkdir(join(repo, sub), { recursive: true });
+    const repoRoots = await ensureStateRoots(await resolveWorkspaceScope(join(repo, 'a')), { OMP_PEERS_DIR: fx.dir });
+    const repoRecord = peerRecordPath(repoRoots, fx.self.pid, fx.self.instance);
+    const turn = { messages: [{ role: 'user', content: 'turn' }] };
+    const injects = async () => Array.isArray((await fx.fake.emit('context', turn))?.messages);
+    // Outbound refusals are decided before any fs work; a send that reaches
+    // the scan stalls behind the held threadpool and reports as pending.
+    const sendNow = (to) =>
+      Promise.race([
+        fx.tools.get('peer_send').execute('fixture-mv', { to, message: 'still here?' }).then(toolText),
+        sleep(500).then(() => 'still pending'),
+      ]);
+    let release;
+    try {
+      assert.ok(await injects(), 'the armed scope injects its roster');
+
+      release = await holdThreadpool('mv-a');
+      fx.fake.ctx.cwd = join(repo, 'a');
+      assert.equal(await injects(), false, 'no old-scope roster once the cwd left that codebase');
+      const away = await sendNow('probe');
+      assert.ok(away.includes('session_transition'), `outbound refuses while the new scope resolves, got: ${away}`);
+      await release();
+
+      await waitFor(() => existsSync(repoRecord), { label: 'the re-armed record in the repo scope' });
+      await waitFor(() => !existsSync(fx.recordPath), { label: 'the old scope record removal' });
+      await waitFor(injects, { label: 'the fence lift after the re-arm' });
+      const rearmed = JSON.parse(await readFile(repoRecord, 'utf8'));
+      const probe = makeIdentity(process.pid);
+      await putRecord(repoRoots, probe, { name: 'probe-repo' });
+
+      release = await holdThreadpool('mv-b');
+      fx.fake.ctx.cwd = join(repo, 'b');
+      assert.equal(await injects(), false, 'the fence also covers a cwd whose scope is still unresolved');
+      const within = await sendNow('probe-repo');
+      assert.ok(within.includes('session_transition'), `outbound refuses until the scope resolves, got: ${within}`);
+      await release();
+
+      await waitFor(injects, { label: 'the same-scope fence lift' });
+      const kept = JSON.parse(await readFile(repoRecord, 'utf8'));
+      assert.equal(kept.startedAt, rearmed.startedAt, 'a same-scope move keeps the arm instead of re-arming');
+      const raw = openRaw(peerEndpoint(repoRoots, fx.self.pid, fx.self.instance));
+      await raw.connect();
+      const hs = await verifiedHandshake(raw, fx.self);
+      raw.send(requestFrame({ ...hs, sender: probe, receiver: fx.self, payload: { type: 'ping' } }));
+      assert.equal(terminalCode(await raw.nextLine()), 'pong', 'acceptance resumes once the same scope is confirmed');
+      raw.close();
+    } finally {
+      await release?.();
+      await fx.teardown();
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('arms in the latest context when the cwd moved before the first arm started', { timeout: 30000 }, async () => {
+    const dir = join(ROOT_TMP, 'late');
+    const restore = usePeersDir(dir);
+    const moved = join(ROOT_TMP, 'late-code');
+    await mkdir(moved, { recursive: true });
+    const fake = createFakeHost();
+    extension(fake.host);
+    try {
+      await fake.emit('session_start', { reason: 'startup' });
+      // A distinct context from another codebase lands before the convergence
+      // timer fires; the fixture's emit would reuse the startup ctx object.
+      const movedCtx = { ...fake.ctx, cwd: moved };
+      for (const handler of fake.handlers.get('input') ?? []) await handler({ source: 'interactive' }, movedCtx);
+      const movedRoots = await ensureStateRoots(await resolveWorkspaceScope(moved), { OMP_PEERS_DIR: dir });
+      await waitFor(() => hasOwnRecord(movedRoots.peersDir), { label: 'the record in the latest codebase scope' });
+      assert.ok(!hasOwnRecord(scopedPeersDir(dir)), 'nothing is advertised in the stale startup scope');
+    } finally {
+      await fake.emit('session_shutdown', undefined);
+      restore();
+      await rm(dir, { recursive: true, force: true });
+      await rm(moved, { recursive: true, force: true });
     }
   });
 });
@@ -1459,7 +1767,7 @@ function fakeEditorText(fake) {
 }
 
 function readSyncInstance(dir) {
-  const peersDir = join(dir, 'peers');
+  const peersDir = scopedPeersDir(dir);
   try {
     const hit = require$readdirSync(peersDir).find((entry) => entry.startsWith(`${process.pid}-`) && entry.endsWith('.json'));
     if (hit === undefined) return '0'.repeat(32);

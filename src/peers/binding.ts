@@ -37,6 +37,7 @@ import { createHostDelivery, WakeLimiter } from './inbound.js';
 import { PendingStore, requestMsg, sendMsg, statusOf, type OutboundDeps, type OutboundResult } from './outbound.js';
 import { buildPeersNote, sanitizeDisplay, withRosterNote } from './roster.js';
 import type { RosterMessage, RosterRow } from './roster.js';
+import { resolveWorkspaceScope, scopeId } from './scope.js';
 import { classifySession } from './session-kind.js';
 import type { SessionKind } from './session-kind.js';
 import {
@@ -112,6 +113,22 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
   let depsRef: OutboundDeps | undefined;
   let deliveryRef: HostDelivery | undefined;
   let cachedPeers: PeerRecordV2[] = [];
+
+  // Codebase scope. armedCwd is the cwd string the current arm resolved its
+  // scope from and armedScope is that scope's id. Commit points compare the
+  // live cwd against armedCwd (one string compare); only a differing cwd
+  // queues an async rescope. targetCwd is the newest differing cwd seen, so
+  // concurrent changes collapse to the latest one. rescopeRuns counts queued
+  // plus running rescopes; while it is nonzero the armed scope is fenced
+  // exactly like a pending transcript transition, because the live context
+  // may already belong to another codebase.
+  let armedCwd: string | undefined;
+  let armedScope: string | undefined;
+  let targetCwd: string | undefined;
+  let rescopeQueued = false;
+  let rescopeRuns = 0;
+  let armTask: Promise<void> | undefined;
+  let scopeChain: Promise<void> = Promise.resolve();
 
   // Host context, timers, and scheduling.
   let lastCtx: CommandContextLike | undefined;
@@ -191,15 +208,20 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
     return diagnostic ?? 'peers: not armed';
   }
 
+  /** A transcript transition or an unsettled codebase scope fences the arm. */
+  function fenced(): boolean {
+    return transitionPending || rescopeRuns > 0;
+  }
+
   function acceptance(): AcceptanceState {
     if (closed) return 'shutting_down';
-    if (transitionPending) return 'session_transition';
+    if (fenced()) return 'session_transition';
     return 'accepting';
   }
 
   function gateResult(): OutboundResult | undefined {
     if (closed) return { code: 'shutting_down' };
-    if (transitionPending) return { code: 'session_transition' };
+    if (fenced()) return { code: 'session_transition' };
     if (!armed || depsRef === undefined) return { code: 'host_unavailable', detail: notArmedText() };
     return undefined;
   }
@@ -290,6 +312,172 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
     heldCount = 0;
     cachedPeers = [];
     clearTransition();
+    noteCwd(lastCtx);
+  }
+
+  // --- Codebase scope: arm-time resolution and cwd-change rescoping.
+
+  /** Working directory the session runs in: ctx.cwd when set, else the process cwd. */
+  function cwdOf(ctx: CommandContextLike): string {
+    return typeof ctx.cwd === 'string' && ctx.cwd !== '' ? ctx.cwd : process.cwd();
+  }
+
+  /**
+   * Scope check at a commit point: one string compare against the armed cwd.
+   * A differing cwd (OMP relocating the session in-process, or a switch or
+   * resume bringing a context from another directory) fences the armed scope
+   * at once and queues one serialized async rescope; repeated changes before
+   * it runs collapse to the latest cwd. Before an arm has claimed a cwd the
+   * change is already recorded in lastCtx, which every arm reads when it
+   * starts and reconciles against when it finishes.
+   */
+  function noteCwd(ctx: CommandContextLike | undefined): void {
+    if (closed || failed || ctx === undefined || armedCwd === undefined) return;
+    let cwd: string;
+    try {
+      cwd = cwdOf(ctx);
+    } catch {
+      // process.cwd throws when the directory is gone; keep the current scope.
+      return;
+    }
+    if (cwd === (targetCwd ?? armedCwd)) return;
+    targetCwd = cwd;
+    if (rescopeQueued) return;
+    rescopeQueued = true;
+    rescopeRuns += 1;
+    scopeChain = scopeChain.then(runRescope);
+    void track(scopeChain);
+  }
+
+  /** Settle every presence write already chained, including ones queued while draining. */
+  async function drainPresenceWrites(): Promise<void> {
+    for (let chain = beatChain; ; chain = beatChain) {
+      await chain;
+      if (chain === beatChain) return;
+    }
+  }
+
+  /**
+   * Resolve the newest differing cwd. The same scope only adopts the new cwd
+   * string and lifts the fence; another scope tears the arm down and re-arms
+   * with the latest context so the session moves to that codebase's peer
+   * group. A newer cwd observed during the resolve supersedes this run
+   * (latest wins) and keeps the fence up until it settles.
+   */
+  async function runRescope(): Promise<void> {
+    rescopeQueued = false;
+    const cwd = targetCwd;
+    try {
+      // An arm still in flight settles before its scope is compared.
+      if (armTask !== undefined) await armTask;
+      if (closed || failed || cwd === undefined || cwd !== targetCwd) return;
+      if (cwd === armedCwd) {
+        targetCwd = undefined;
+        return;
+      }
+      const scopeKey = await resolveWorkspaceScope(cwd);
+      if (closed || failed || cwd !== targetCwd) return;
+      targetCwd = undefined;
+      if (armedScope !== undefined && scopeId(scopeKey) === armedScope) {
+        armedCwd = cwd;
+        return;
+      }
+      if (!armed) return;
+      await disarm();
+      // Every beat and name write the old arm started settles before any
+      // re-arm, so a stale write's cleanup can never unlink the record or
+      // socket a re-arm into the same scope directory publishes.
+      await drainPresenceWrites();
+      const ctx = lastCtx;
+      if (closed || ctx === undefined) return;
+      armTask = track(arm(ctx, { cwd, scopeKey }));
+      await armTask;
+    } catch (err) {
+      log(`rescope failed: ${messageOf(err)}`);
+    } finally {
+      rescopeRuns -= 1;
+    }
+  }
+
+  /**
+   * Tear the live arm down so the session can re-arm in another codebase
+   * scope. Same fencing as a transition commit plus shutdown, without closing
+   * the binding (the rescope run that calls this keeps acceptance fenced):
+   * the epoch bump fences every in-flight arm, beat, and name write (each
+   * removes its late record from the roots it captured), waiting inbound work
+   * settles with session_transition, pending requests reject with
+   * session_transition, and the own record and endpoint leave the old scope
+   * directory.
+   */
+  async function disarm(): Promise<void> {
+    bindingEpoch += 1;
+    armed = false;
+    depsRef = undefined;
+    if (heartbeatTimer !== undefined && timers !== undefined) {
+      try {
+        timers.clearTimer(heartbeatTimer);
+      } catch {
+        // Timer clearing is best-effort.
+      }
+    }
+    heartbeatTimer = undefined;
+    const handle = activeHandle;
+    try {
+      handle?.purgeStaleWork(
+        (captured) => captured.binding !== bindingEpoch || captured.transcript !== transcriptEpoch
+      );
+    } catch {
+      // Purge is synchronous in-process work; never throw into the host.
+    }
+    try {
+      pending.rejectAll('session_transition');
+    } catch {
+      // PendingStore settles synchronously.
+    }
+    heldCount = 0;
+    cachedPeers = [];
+    record = undefined;
+    recordWritten = false;
+    lastNameRequested = undefined;
+    const oldRoots = roots;
+    const self = identity;
+    try {
+      if (oldRoots !== undefined && self !== undefined) {
+        try {
+          await removeOwnRecord(oldRoots, self.pid, self.instance);
+        } catch {
+          // Removal is best-effort at teardown.
+        }
+      }
+      await safeClose(handle);
+      try {
+        await removeEndpointIfOurs();
+      } catch {
+        // Endpoint removal is best-effort at teardown.
+      }
+    } finally {
+      roots = undefined;
+      activeHandle = undefined;
+      armedCwd = undefined;
+      armedScope = undefined;
+    }
+  }
+
+  /**
+   * Cleanup for a presence write that lost its epoch: it may have resurrected
+   * the record under the roots it captured. A later arm that owns the same
+   * scope directory again keeps its record and socket; otherwise both go.
+   */
+  async function removeStaleRecord(
+    staleRoots: StateRoots,
+    self: { pid: number; instance: string }
+  ): Promise<void> {
+    if (!closed && roots !== undefined && roots !== staleRoots && roots.peersDir === staleRoots.peersDir) return;
+    try {
+      await removeOwnRecord(staleRoots, self.pid, self.instance);
+    } catch {
+      // Removal is best-effort during teardown.
+    }
   }
 
   // --- Naming: one requested-name computation, one serialized refresh.
@@ -344,11 +532,7 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
     }
     if (closed || bindingAtStart !== bindingEpoch) {
       // A late write must not resurrect the record after shutdown.
-      try {
-        await removeOwnRecord(currentRoots, currentIdentity.pid, currentIdentity.instance);
-      } catch {
-        // Removal is best-effort during teardown.
-      }
+      await removeStaleRecord(currentRoots, currentIdentity);
       return;
     }
     if (record === current) current.name = resolved.name;
@@ -404,6 +588,7 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
   function commitPoint(ctx: CommandContextLike | undefined, resetHop: boolean): void {
     if (closed) return;
     if (ctx !== undefined) lastCtx = ctx;
+    noteCwd(lastCtx);
     if (resetHop) {
       lastInboundFrom = undefined;
       lastInboundHop = 0;
@@ -569,7 +754,7 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
       admissionCode: base.admissionCode,
       submitBatch: (envelopes): Promise<{ code: ResultCode; detail?: string }> => {
         if (closed) return Promise.resolve({ code: 'shutting_down' });
-        if (transitionPending) return Promise.resolve({ code: 'session_transition' });
+        if (fenced()) return Promise.resolve({ code: 'session_transition' });
         if (!armed || depsRef === undefined) {
           return Promise.resolve({ code: 'host_unavailable', detail: notArmedText() });
         }
@@ -631,11 +816,7 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
       }
       if (closed || bindingAtStart !== bindingEpoch) {
         // A late write must not resurrect the record after shutdown.
-        try {
-          await removeOwnRecord(currentRoots, currentIdentity.pid, currentIdentity.instance);
-        } catch {
-          // Removal is best-effort during teardown.
-        }
+        await removeStaleRecord(currentRoots, currentIdentity);
         return;
       }
       recordWritten = true;
@@ -760,7 +941,9 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
           if (toolSurfacesConverged()) {
             stopPoll();
             contextInstalled = true;
-            void track(arm(ctx));
+            // The newest context wins: a cwd change seen before this timer
+            // fired is armed directly instead of being dropped.
+            armTask = track(arm(lastCtx ?? ctx));
             return;
           }
           if (Date.now() >= deadline) {
@@ -784,7 +967,7 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
     startedAt: number,
     scan: PeerScan
   ): PeerRecordV2 {
-    const project = projectFor(ctx.cwd !== '' ? ctx.cwd : process.cwd());
+    const project = projectFor(cwdOf(ctx));
     const requested = requestedNameFor(ctx, project, self);
     lastNameRequested = requested;
     const resolved = resolveName({
@@ -812,7 +995,11 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
     };
   }
 
-  async function arm(ctx: CommandContextLike): Promise<void> {
+  /**
+   * `known` carries a scope key a rescope already resolved; it is reused only
+   * when it was resolved for the cwd this arm actually runs in.
+   */
+  async function arm(ctx: CommandContextLike, known?: { cwd: string; scopeKey: string }): Promise<void> {
     if (closed || armed || arming || failed) return;
     arming = true;
     const bindingAtStart = bindingEpoch;
@@ -820,9 +1007,15 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
     let handle: ServerHandle | undefined;
     try {
       if (process.platform !== 'darwin') throw new Error('unsupported platform: macOS is the only supported target');
-      const stateRoots = await ensureStateRoots();
+      const cwd = cwdOf(ctx);
+      armedCwd = cwd;
+      const scopeKey =
+        known !== undefined && known.cwd === cwd ? known.scopeKey : await resolveWorkspaceScope(cwd);
+      if (stale()) return;
+      const stateRoots = await ensureStateRoots(scopeKey);
       if (stale()) return;
       roots = stateRoots;
+      armedScope = stateRoots.scope;
       if (identity === undefined) identity = { pid: process.pid, ...newIdentity() };
       const self = identity;
       const endpoint = peerEndpoint(stateRoots, self.pid, self.instance);
@@ -897,6 +1090,9 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
         void track(beatChain);
       }, HEARTBEAT_MS);
       armed = true;
+      // A cwd change seen while this arm resolved (or recorded before it
+      // started) reconciles through the rescope path before traffic flows.
+      noteCwd(lastCtx);
       // Plan section 2/4: the host context hook installs only after a successful
       // top-level arm; nested/unknown/restricted factories register no handler.
       if (!contextHookRegistered) {
@@ -949,6 +1145,7 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
   function onSessionStart(ctx: CommandContextLike): void {
     if (closed) return;
     lastCtx = ctx;
+    noteCwd(ctx);
     if (originKind === undefined) {
       let kind: SessionKind = 'unknown';
       try {
@@ -1015,7 +1212,7 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
 
   function onContext(event: unknown, ctx: CommandContextLike): { messages: RosterMessage[] } | undefined {
     commitPoint(ctx, false);
-    if (closed || !contextInstalled || !armed || transitionPending || originKind !== 'top-level') return undefined;
+    if (closed || !contextInstalled || !armed || fenced() || originKind !== 'top-level') return undefined;
     const selfName = record?.name;
     if (selfName === undefined) return undefined;
     const payload = asRecord(event);
@@ -1062,7 +1259,7 @@ export function createPeerBinding(pi: ExtensionHostLike): PeerBinding {
     // Running /peers is a local command entry point.
     commitPoint(lastCtx, true);
     const now = Date.now();
-    let self = { name: '', project: projectFor(lastCtx?.cwd ? lastCtx.cwd : process.cwd()) };
+    let self = { name: '', project: projectFor(lastCtx !== undefined ? cwdOf(lastCtx) : process.cwd()) };
     let selfRow: RosterRow | undefined;
     if (record !== undefined) {
       self = { name: record.name, project: record.project };

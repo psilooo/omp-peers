@@ -16,6 +16,9 @@ export type { StateRoots } from './store/paths.js';
 export { hasDuplicateRoutableNames, newIdentity, projectFor, resolveName } from './peers/ids.js';
 export type { ResolveNameInput } from './peers/ids.js';
 
+// Codebase scope.
+export { resolveWorkspaceScope, scopeId } from './peers/scope.js';
+
 // Presence.
 export { formatBeatAge, readPeerRecord, removeOwnRecord, scanPeers, writeOwnRecord } from './peers/presence.js';
 export type { PeerScan } from './peers/presence.js';

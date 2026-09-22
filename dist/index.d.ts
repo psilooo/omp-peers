@@ -10,6 +10,7 @@ export { ensureStateRoots, peerEndpoint, peerRecordPath, rootHash, validateUnixE
 export type { StateRoots } from './store/paths.js';
 export { hasDuplicateRoutableNames, newIdentity, projectFor, resolveName } from './peers/ids.js';
 export type { ResolveNameInput } from './peers/ids.js';
+export { resolveWorkspaceScope, scopeId } from './peers/scope.js';
 export { formatBeatAge, readPeerRecord, removeOwnRecord, scanPeers, writeOwnRecord } from './peers/presence.js';
 export type { PeerScan } from './peers/presence.js';
 export { MAX_PEER_TODOS, MAX_PEER_TODO_TEXT_CHARS, managedTimers, readBusy, readModel, readNativeTodos, readSessionName, readTitleSource, } from './peers/host.js';

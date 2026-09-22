@@ -16,7 +16,7 @@
         "ref": "v2.0.0"
       },
       "version": "2.0.0",
-      "description": "Every running top-level omp instance sees the others by peer name and can prompt them via peer_send.",
+      "description": "Top-level omp sessions in the same codebase see each other by peer name and can prompt them via peer_send; other codebases stay invisible and unreachable.",
       "category": "development",
       "license": "MIT",
       "keywords": ["multi-agent", "peer-discovery", "cross-session", "peers", "omp"]

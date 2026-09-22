@@ -95,7 +95,7 @@ export function formatPeersText(snap, now) {
 export function registerPeersCommand(pi, getSnapshot) {
     try {
         pi.registerCommand('peers', {
-            description: 'List live peer instances on this machine',
+            description: 'List live peer sessions in this codebase',
             handler: async (_args, ctx) => {
                 try {
                     const snap = await getSnapshot();

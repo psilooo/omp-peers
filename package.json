@@ -1,7 +1,7 @@
 {
   "name": "omp-peers",
   "version": "2.0.0",
-  "description": "Cross-session peer awareness for omp: every running top-level instance sees every other, live, on the same machine. /peers to list, /rename to name, peer_send to talk.",
+  "description": "Cross-session peer awareness for omp: running top-level instances in the same codebase (one git repository and its worktrees, or one exact directory) see each other live on the same machine; other codebases stay invisible and unreachable. /peers to list, /rename to name, peer_send to talk.",
   "type": "module",
   "private": true,
   "main": "./dist/index.js",

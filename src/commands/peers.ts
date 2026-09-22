@@ -117,7 +117,7 @@ export function registerPeersCommand(
 ): void {
   try {
     pi.registerCommand('peers', {
-      description: 'List live peer instances on this machine',
+      description: 'List live peer sessions in this codebase',
       handler: async (_args: string, ctx: CommandContextLike) => {
         try {
           const snap = await getSnapshot();

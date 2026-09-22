@@ -13,9 +13,9 @@
  */
 
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createConnection, createServer } from 'node:net';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -118,14 +118,19 @@ const { ensureStateRoots, peerEndpoint, peerRecordPath, rootHash, validateUnixEn
 );
 const { readJsonBounded } = await import('../dist/store/atomic.js');
 const { createFakeHost, startChild, startPair } = await import('./fixture/two-child.mjs');
+const { resolveWorkspaceScope } = await import('../dist/peers/scope.js');
 
-// A compact base keeps every derived endpoint under the 103-byte macOS
-// sun_path ceiling: the default TMPDIR under /var/folders overruns it, the
-// kernel truncates the instance hex that distinguishes sockets, and distinct
-// paths systematically collide with EADDRINUSE.
-const ROOT_TMP = join('/tmp', `p2-${process.pid}-${Date.now().toString(36)}`);
-await mkdir(ROOT_TMP, { recursive: true });
+// A compact base keeps every derived endpoint
+// (`<root>/<label>/peers/<16 hex scope>/<16 hex>.sock`) under the
+// 103-byte macOS sun_path ceiling once /tmp resolves to /private/tmp: the
+// default TMPDIR under /var/folders overruns it, the kernel truncates the
+// instance hex that distinguishes sockets, and distinct paths systematically
+// collide with EADDRINUSE.
+const ROOT_TMP = await mkdtemp(join('/tmp', 'p2-'));
 after(() => rm(ROOT_TMP, { recursive: true, force: true }));
+// In-process fake hosts report process.cwd() as ctx.cwd, so every binding in
+// this suite arms in this codebase scope; hand-built roots share it.
+const HOST_SCOPE = await resolveWorkspaceScope(process.cwd());
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -140,7 +145,7 @@ async function waitFor(predicate, { timeout = 5000, interval = 10, label = 'cond
 
 /** Fresh isolated state roots per describe block. */
 async function makeRoots(label) {
-  return ensureStateRoots({ OMP_PEERS_DIR: join(ROOT_TMP, label) });
+  return ensureStateRoots(HOST_SCOPE, { OMP_PEERS_DIR: join(ROOT_TMP, label) });
 }
 
 /**
@@ -2565,6 +2570,24 @@ describe('release constants at their boundaries', () => {
     );
   });
 
+  it('keeps the default-root scoped endpoint within the macOS ceiling for long usernames and pids', () => {
+    // Default layout for an 11-character username; the widest pid has 10 digits.
+    const root = '/Users/christopher/.omp/var/omp-peers';
+    const scope = 'a'.repeat(16);
+    const roots = { root, peersDir: join(root, 'peers', scope), scope };
+    const pid = 2147483647;
+    const instance = 'f'.repeat(INSTANCE_HEX_CHARS);
+    const endpoint = peerEndpoint(roots, pid, instance);
+    assert.ok(Buffer.byteLength(endpoint, 'utf8') <= 103, `endpoint fits 103 bytes: ${endpoint}`);
+    assert.doesNotThrow(() => validateUnixEndpoint(endpoint));
+    assert.equal(dirname(endpoint), roots.peersDir, 'the endpoint lives in the scope directory');
+    assert.notEqual(
+      peerEndpoint(roots, pid, 'e'.repeat(INSTANCE_HEX_CHARS)),
+      endpoint,
+      'distinct instances of one pid get distinct endpoints'
+    );
+  });
+
   // __APPEND__
 });
 
@@ -2657,7 +2680,7 @@ describe('real child processes over unix sockets', () => {
       await child.ready;
       const parsed = parseRecord(await readFile(child.recordPath, 'utf8'));
       assert.equal(parsed.kind, 'v2', 'the child writes a strict v2 presence record');
-      const childRoots = await ensureStateRoots({ OMP_PEERS_DIR: peerDir });
+      const childRoots = await ensureStateRoots(child.scopeKey, { OMP_PEERS_DIR: peerDir });
       const endpoint = peerEndpoint(childRoots, parsed.record.pid, parsed.record.instance);
       await waitFor(
         () => new Promise((resolve) => {
@@ -2874,7 +2897,7 @@ describe('review-fix regressions', () => {
     // protection bypass) and the same-peer reply exemption compared a
     // pid:instance key against a peer name (never matching). The real
     // extension drives the classification from each host entry's fields.
-    const hopRoots = await ensureStateRoots({ OMP_PEERS_DIR: join(ROOT_TMP, 'hop-origin') });
+    const hopRoots = await ensureStateRoots(HOST_SCOPE, { OMP_PEERS_DIR: join(ROOT_TMP, 'hop-origin') });
     const peer = makeIdentity();
     const sinkIdent = makeIdentity();
     await putRecord(hopRoots, peer, { name: 'sender' });
