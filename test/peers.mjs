@@ -12,6 +12,7 @@
  * Plain Node ESM, no test-runner dependency (also runs under `node --test`).
  */
 
+import { spawn } from 'node:child_process';
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createConnection, createServer } from 'node:net';
 import { join } from 'node:path';
@@ -3014,6 +3015,35 @@ describe('review-fix regressions', () => {
       'every torn record heals through the shared window regardless of directory order'
     );
     assert.ok(elapsed < 300, `one shared healing window stays bounded (took ${elapsed} ms)`);
+  });
+
+  it('retains a dead record that becomes unreadable on the shared reread', async () => {
+    // Regression: the reread result must stand alone. Falling back to the
+    // first (malformed) parse when the reread is unreadable or oversize would
+    // look readable and violate the never-delete-what-cannot-be-read rule for
+    // dead pids, destroying the record and endpoint.
+    const probe = spawn(process.execPath, ['-e', '']);
+    const deadPid = probe.pid;
+    await new Promise((resolve) => probe.on('exit', resolve));
+    const instance = generateInstance();
+    const recordPath = peerRecordPath(roots, deadPid, instance);
+    const endpointPath = peerEndpoint(roots, deadPid, instance);
+    await writeFile(recordPath, `{"v":2,"pid":${deadPid},`, { mode: 0o600 });
+    await writeFile(endpointPath, 'placeholder', { mode: 0o600 });
+    // Inside the shared healing window the body becomes confirmed-oversize,
+    // so the reread is unusable and the entry must be retained as-is.
+    const oversize = (async () => {
+      await sleep(10);
+      await writeFile(recordPath, 'x'.repeat(RECORD_MAX_BYTES + 1), { mode: 0o600 });
+    })();
+    const scan = await scanPeers(roots, { pid: 999999, instance: generateInstance() });
+    await oversize;
+    assert.ok(
+      !scan.routable.some((record) => record.pid === deadPid),
+      'an unreadable reread never becomes routable'
+    );
+    assert.ok(await stat(recordPath).then(() => true, () => false), 'the unreadable dead record is retained');
+    assert.ok(await stat(endpointPath).then(() => true, () => false), 'the unreadable dead record keeps its endpoint');
   });
 });
 
