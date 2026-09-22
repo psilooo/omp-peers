@@ -154,7 +154,6 @@ interface DeferredRead {
   legacy: boolean;
   liveness: Liveness;
   recordPath: string;
-  firstParsed: ParsedRecord | undefined;
 }
 
 async function classifyEntry(
@@ -176,7 +175,7 @@ async function classifyEntry(
   const readable = await recordFileOk(recordPath);
   const first = readable ? await readParsedOnce(recordPath) : { parsed: undefined, retryable: false };
   if (first.retryable) {
-    deferred.push({ id, legacy, liveness, recordPath, firstParsed: first.parsed });
+    deferred.push({ id, legacy, liveness, recordPath });
     return undefined;
   }
   return finishEntry(roots, now, id, legacy, liveness, recordPath, first.parsed);
@@ -294,6 +293,9 @@ export async function scanPeers(
     for (const candidate of deferred) {
       try {
         const retried = await readParsedOnce(candidate.recordPath);
+        // The reread stands alone: falling back to the first (possibly
+        // malformed) parse would let a now-unreadable record look readable
+        // and violate the never-delete-what-cannot-be-read rule.
         const outcome = await finishEntry(
           roots,
           now,
@@ -301,7 +303,7 @@ export async function scanPeers(
           candidate.legacy,
           candidate.liveness,
           candidate.recordPath,
-          retried.parsed ?? candidate.firstParsed
+          retried.parsed
         );
         if (outcome === undefined) {
           continue;

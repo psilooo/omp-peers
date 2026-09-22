@@ -131,7 +131,7 @@ async function classifyEntry(roots, self, now, name, deferred) {
     const readable = await recordFileOk(recordPath);
     const first = readable ? await readParsedOnce(recordPath) : { parsed: undefined, retryable: false };
     if (first.retryable) {
-        deferred.push({ id, legacy, liveness, recordPath, firstParsed: first.parsed });
+        deferred.push({ id, legacy, liveness, recordPath });
         return undefined;
     }
     return finishEntry(roots, now, id, legacy, liveness, recordPath, first.parsed);
@@ -236,7 +236,10 @@ export async function scanPeers(roots, self, now = Date.now()) {
         for (const candidate of deferred) {
             try {
                 const retried = await readParsedOnce(candidate.recordPath);
-                const outcome = await finishEntry(roots, now, candidate.id, candidate.legacy, candidate.liveness, candidate.recordPath, retried.parsed ?? candidate.firstParsed);
+                // The reread stands alone: falling back to the first (possibly
+                // malformed) parse would let a now-unreadable record look readable
+                // and violate the never-delete-what-cannot-be-read rule.
+                const outcome = await finishEntry(roots, now, candidate.id, candidate.legacy, candidate.liveness, candidate.recordPath, retried.parsed);
                 if (outcome === undefined) {
                     continue;
                 }

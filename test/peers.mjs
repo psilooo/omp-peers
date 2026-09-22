@@ -2977,28 +2977,41 @@ describe('review-fix regressions', () => {
     // Regression: retained malformed records are ignored-but-kept by design;
     // their reread handling must neither starve a torn record's healing
     // window nor serialize per-entry delays into the operation deadlines.
+    // Owner-only mode matters: recordFileOk rejects anything looser before
+    // parsing, so umask-default files would never exercise the rereads.
     for (let i = 0; i < 12; i += 1) {
       const garbage = makeIdentity();
-      await writeFile(peerRecordPath(roots, garbage.pid, garbage.instance), `{"v":2,"pid":${garbage.pid},`);
+      await writeFile(peerRecordPath(roots, garbage.pid, garbage.instance), `{"v":2,"pid":${garbage.pid},`, {
+        mode: 0o600,
+      });
     }
     for (let i = 0; i < 5; i += 1) {
       await putRecord(roots, makeIdentity(), { name: `ok-${i}` });
     }
-    const torn = makeIdentity();
-    await putRecord(roots, torn, { name: 'torn-behind' });
-    const tornPath = peerRecordPath(roots, torn.pid, torn.instance);
-    await writeFile(tornPath, `{"v":2,"pid":`);
+    const tornList = [];
+    for (let i = 0; i < 5; i += 1) {
+      const torn = makeIdentity();
+      await putRecord(roots, torn, { name: `torn-${i}` });
+      tornList.push(torn);
+    }
+    for (const torn of tornList) {
+      await writeFile(peerRecordPath(roots, torn.pid, torn.instance), `{"v":2,"pid":`, { mode: 0o600 });
+    }
     const heal = (async () => {
       await sleep(10);
-      await putRecord(roots, torn, { name: 'torn-behind' });
+      for (const torn of tornList) {
+        await putRecord(roots, torn, { name: `torn-${tornList.indexOf(torn)}` });
+      }
     })();
     const started = Date.now();
     const scan = await scanPeers(roots, { pid: 999999, instance: generateInstance() });
     const elapsed = Date.now() - started;
     await heal;
-    assert.ok(
-      scan.routable.some((record) => record.name === 'torn-behind'),
-      'the torn record heals through the shared window regardless of directory order'
+    const recovered = scan.routable.filter((record) => record.name.startsWith('torn-')).map((record) => record.name);
+    assert.deepEqual(
+      recovered.sort(),
+      ['torn-0', 'torn-1', 'torn-2', 'torn-3', 'torn-4'],
+      'every torn record heals through the shared window regardless of directory order'
     );
     assert.ok(elapsed < 300, `one shared healing window stays bounded (took ${elapsed} ms)`);
   });
