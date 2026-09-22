@@ -2972,6 +2972,36 @@ describe('review-fix regressions', () => {
       await peerServer.stop();
     }
   });
+
+  it('heals torn reads behind persistent garbage within one shared window', async () => {
+    // Regression: retained malformed records are ignored-but-kept by design;
+    // their reread handling must neither starve a torn record's healing
+    // window nor serialize per-entry delays into the operation deadlines.
+    for (let i = 0; i < 12; i += 1) {
+      const garbage = makeIdentity();
+      await writeFile(peerRecordPath(roots, garbage.pid, garbage.instance), `{"v":2,"pid":${garbage.pid},`);
+    }
+    for (let i = 0; i < 5; i += 1) {
+      await putRecord(roots, makeIdentity(), { name: `ok-${i}` });
+    }
+    const torn = makeIdentity();
+    await putRecord(roots, torn, { name: 'torn-behind' });
+    const tornPath = peerRecordPath(roots, torn.pid, torn.instance);
+    await writeFile(tornPath, `{"v":2,"pid":`);
+    const heal = (async () => {
+      await sleep(10);
+      await putRecord(roots, torn, { name: 'torn-behind' });
+    })();
+    const started = Date.now();
+    const scan = await scanPeers(roots, { pid: 999999, instance: generateInstance() });
+    const elapsed = Date.now() - started;
+    await heal;
+    assert.ok(
+      scan.routable.some((record) => record.name === 'torn-behind'),
+      'the torn record heals through the shared window regardless of directory order'
+    );
+    assert.ok(elapsed < 300, `one shared healing window stays bounded (took ${elapsed} ms)`);
+  });
 });
 
 

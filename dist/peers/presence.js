@@ -71,20 +71,13 @@ async function unlinkQuiet(path) {
     }
 }
 const READ_RETRY_DELAY_MS = 50;
-const SCAN_RETRY_BUDGET = 3;
-/**
- * One bounded reread for transient torn reads: records are overwritten in
- * place, so a concurrent heartbeat can expose a partial body. A second
- * unusable read stays unusable; byte, ownership, identity, and freshness
- * checks are all preserved by the callers.
- */
-async function readParsedRecord(path, takeRetry) {
+/** One bounded read; a torn parse or transient failure is retryable, a
+ * confirmed oversize body fails deterministically. */
+async function readParsedOnce(path) {
     const raw = await readJsonBounded(path, RECORD_MAX_BYTES);
-    let parsed = raw === undefined ? undefined : parseRecord(raw);
+    const parsed = raw === undefined ? undefined : parseRecord(raw);
     if (parsed !== undefined && parsed.kind !== 'malformed')
-        return parsed;
-    // Oversize bodies fail deterministically; a torn parse or a transient
-    // read failure is worth exactly one delayed reread when the budget allows.
+        return { parsed, retryable: false };
     if (raw === undefined) {
         let size = -1;
         try {
@@ -94,14 +87,24 @@ async function readParsedRecord(path, takeRetry) {
             size = -1;
         }
         if (size > RECORD_MAX_BYTES)
-            return parsed;
+            return { parsed, retryable: false };
     }
-    if (!takeRetry())
-        return parsed;
+    return { parsed, retryable: true };
+}
+/**
+ * Single-record path: exactly one delayed reread after an unusable first
+ * read. Records are overwritten in place, so a concurrent heartbeat can
+ * expose a partial body. The scan path batches its rereads behind one shared
+ * window instead (scanPeers), so retained unusable records can never
+ * serialize their delays into the status or send deadlines.
+ */
+async function readParsedRecord(path) {
+    const first = await readParsedOnce(path);
+    if (!first.retryable)
+        return first.parsed;
     await delayMs(READ_RETRY_DELAY_MS);
-    const retried = await readJsonBounded(path, RECORD_MAX_BYTES);
-    parsed = retried === undefined ? undefined : parseRecord(retried);
-    return parsed;
+    const retried = await readParsedOnce(path);
+    return retried.parsed;
 }
 function parseEntryName(name) {
     const v2 = V2_ENTRY_NAME.exec(name);
@@ -116,8 +119,7 @@ function parseEntryName(name) {
     }
     return undefined;
 }
-/** Apply every scan acceptance and retention rule to one directory entry. */
-async function classifyEntry(roots, self, now, name, takeRetry) {
+async function classifyEntry(roots, self, now, name, deferred) {
     const id = parseEntryName(name);
     if (id === undefined) {
         return undefined;
@@ -127,7 +129,14 @@ async function classifyEntry(roots, self, now, name, takeRetry) {
     const isSelf = id.instance !== null && id.pid === self.pid && id.instance === self.instance;
     const liveness = isSelf ? 'alive' : probePid(id.pid);
     const readable = await recordFileOk(recordPath);
-    const parsed = readable ? await readParsedRecord(recordPath, takeRetry) : undefined;
+    const first = readable ? await readParsedOnce(recordPath) : { parsed: undefined, retryable: false };
+    if (first.retryable) {
+        deferred.push({ id, legacy, liveness, recordPath, firstParsed: first.parsed });
+        return undefined;
+    }
+    return finishEntry(roots, now, id, legacy, liveness, recordPath, first.parsed);
+}
+async function finishEntry(roots, now, id, legacy, liveness, recordPath, parsed) {
     if (liveness === 'dead') {
         // Never delete a future version, and never delete what cannot be read:
         // either could belong to a newer plugin.
@@ -192,10 +201,10 @@ export async function scanPeers(roots, self, now = Date.now()) {
         return { routable, incompatible };
     }
     let seen = 0;
-    // Retained malformed records are ignored-but-kept by design; without a
-    // scan-wide cap their torn-read retries would serialize into the status
-    // and send deadlines. At most three entries per scan buy a reread.
-    let scanRetries = SCAN_RETRY_BUDGET;
+    // Torn or transiently unreadable entries wait for one shared healing
+    // window and are reread together, so retained unusable records can never
+    // serialize 50 ms delays into the status or send deadlines.
+    const deferred = [];
     try {
         for await (const entry of handle) {
             if (seen >= MAX_DIR_ENTRIES) {
@@ -203,10 +212,7 @@ export async function scanPeers(roots, self, now = Date.now()) {
             }
             seen += 1;
             try {
-                const outcome = await classifyEntry(roots, self, now, entry.name, () => {
-                    scanRetries -= 1;
-                    return scanRetries >= 0;
-                });
+                const outcome = await classifyEntry(roots, self, now, entry.name, deferred);
                 if (outcome === undefined) {
                     continue;
                 }
@@ -224,6 +230,27 @@ export async function scanPeers(roots, self, now = Date.now()) {
     }
     catch {
         // Iteration failure returns whatever was classified so far.
+    }
+    if (deferred.length > 0) {
+        await delayMs(READ_RETRY_DELAY_MS);
+        for (const candidate of deferred) {
+            try {
+                const retried = await readParsedOnce(candidate.recordPath);
+                const outcome = await finishEntry(roots, now, candidate.id, candidate.legacy, candidate.liveness, candidate.recordPath, retried.parsed ?? candidate.firstParsed);
+                if (outcome === undefined) {
+                    continue;
+                }
+                if (outcome.kind === 'incompatible') {
+                    incompatible.push({ pid: outcome.pid, version: outcome.version });
+                }
+                else if (routable.length < MAX_ROUTABLE_PEERS) {
+                    routable.push(outcome.record);
+                }
+            }
+            catch {
+                // One bad entry never aborts or fails the scan.
+            }
+        }
     }
     return { routable, incompatible };
 }
@@ -243,7 +270,7 @@ export async function readPeerRecord(roots, pid, instance, now = Date.now()) {
     if (!(await recordFileOk(path))) {
         return undefined;
     }
-    const parsed = await readParsedRecord(path, () => true);
+    const parsed = await readParsedRecord(path);
     if (parsed === undefined || parsed.kind !== 'v2') {
         return undefined;
     }
