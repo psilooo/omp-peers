@@ -78,30 +78,29 @@ const SCAN_RETRY_BUDGET = 3;
  * unusable read stays unusable; byte, ownership, identity, and freshness
  * checks are all preserved by the callers.
  */
-async function readParsedRecord(path, allowRetry) {
-    let parsed;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-        const raw = await readJsonBounded(path, RECORD_MAX_BYTES);
-        parsed = raw === undefined ? undefined : parseRecord(raw);
-        if (parsed !== undefined && parsed.kind !== 'malformed')
+async function readParsedRecord(path, takeRetry) {
+    const raw = await readJsonBounded(path, RECORD_MAX_BYTES);
+    let parsed = raw === undefined ? undefined : parseRecord(raw);
+    if (parsed !== undefined && parsed.kind !== 'malformed')
+        return parsed;
+    // Oversize bodies fail deterministically; a torn parse or a transient
+    // read failure is worth exactly one delayed reread when the budget allows.
+    if (raw === undefined) {
+        let size = -1;
+        try {
+            size = (await lstat(path)).size;
+        }
+        catch {
+            size = -1;
+        }
+        if (size > RECORD_MAX_BYTES)
             return parsed;
-        // Oversize bodies fail deterministically; a torn parse or a transient
-        // read failure is worth exactly one reread when the budget allows.
-        if (raw === undefined) {
-            let size = -1;
-            try {
-                size = (await lstat(path)).size;
-            }
-            catch {
-                size = -1;
-            }
-            if (size > RECORD_MAX_BYTES)
-                return parsed;
-        }
-        if (attempt === 0 && allowRetry) {
-            await delayMs(READ_RETRY_DELAY_MS);
-        }
     }
+    if (!takeRetry())
+        return parsed;
+    await delayMs(READ_RETRY_DELAY_MS);
+    const retried = await readJsonBounded(path, RECORD_MAX_BYTES);
+    parsed = retried === undefined ? undefined : parseRecord(retried);
     return parsed;
 }
 function parseEntryName(name) {
@@ -128,7 +127,7 @@ async function classifyEntry(roots, self, now, name, takeRetry) {
     const isSelf = id.instance !== null && id.pid === self.pid && id.instance === self.instance;
     const liveness = isSelf ? 'alive' : probePid(id.pid);
     const readable = await recordFileOk(recordPath);
-    const parsed = readable ? await readParsedRecord(recordPath, takeRetry()) : undefined;
+    const parsed = readable ? await readParsedRecord(recordPath, takeRetry) : undefined;
     if (liveness === 'dead') {
         // Never delete a future version, and never delete what cannot be read:
         // either could belong to a newer plugin.
@@ -244,7 +243,7 @@ export async function readPeerRecord(roots, pid, instance, now = Date.now()) {
     if (!(await recordFileOk(path))) {
         return undefined;
     }
-    const parsed = await readParsedRecord(path, true);
+    const parsed = await readParsedRecord(path, () => true);
     if (parsed === undefined || parsed.kind !== 'v2') {
         return undefined;
     }
